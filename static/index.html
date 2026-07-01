@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Crypto Trading Bot</title>
+<style>
+  :root {
+    --bg: #0d0d0f;
+    --surface: #16181d;
+    --surface2: #1e2028;
+    --border: #2a2d38;
+    --text: #e8eaf0;
+    --muted: #7b8099;
+    --green: #22c55e;
+    --green-dim: #16a34a22;
+    --red: #ef4444;
+    --red-dim: #dc262622;
+    --yellow: #f59e0b;
+    --blue: #3b82f6;
+    --cyan: #06b6d4;
+    --purple: #8b5cf6;
+    --radius: 12px;
+    --radius-sm: 8px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Inter', sans-serif; font-size: 14px; min-height: 100vh; }
+
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 18px 28px; border-bottom: 1px solid var(--border);
+    background: var(--surface); position: sticky; top: 0; z-index: 10;
+  }
+  .logo { display: flex; align-items: center; gap: 10px; }
+  .logo-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--cyan); box-shadow: 0 0 8px var(--cyan);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse { 0%,100%{opacity:1}50%{opacity:0.35} }
+  .logo h1 { font-size: 17px; font-weight: 600; letter-spacing: -0.3px; }
+  .logo h1 span { color: var(--muted); font-weight: 400; }
+  .header-right { display: flex; align-items: center; gap: 16px; }
+  .last-updated { color: var(--muted); font-size: 12px; }
+
+  main { padding: 24px 28px; display: flex; flex-direction: column; gap: 20px; }
+
+  /* Stat cards */
+  .grid-4 { display: grid; grid-template-columns: repeat(4,1fr); gap: 16px; }
+  .grid-auto { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px,1fr)); gap: 16px; }
+  @media(max-width:900px){ .grid-4{ grid-template-columns:1fr 1fr; } }
+  @media(max-width:600px){ .grid-4{ grid-template-columns:1fr; } }
+
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; }
+  .card-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.8px; color: var(--muted); margin-bottom: 10px; }
+  .card-value { font-size: 28px; font-weight: 700; letter-spacing: -0.5px; }
+  .card-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .positive { color: var(--green); }
+  .negative { color: var(--red); }
+  .neutral  { color: var(--text); }
+
+  .badge { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
+  .badge-green  { background: var(--green-dim); color: var(--green); }
+  .badge-red    { background: var(--red-dim);   color: var(--red); }
+  .badge-yellow { background: #f59e0b22; color: var(--yellow); }
+  .badge-cyan   { background: #06b6d420; color: var(--cyan); }
+  .badge-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+  /* Pair cards */
+  .pair-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px; display: flex; flex-direction: column; gap: 12px; }
+  .pair-card.has-position { border-color: #22c55e44; }
+  .pair-card.paused { opacity: 0.6; }
+  .pair-header { display: flex; align-items: center; justify-content: space-between; }
+  .pair-symbol { font-size: 16px; font-weight: 700; letter-spacing: -0.3px; }
+  .pair-price { font-size: 22px; font-weight: 700; }
+  .pair-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .stat-item { font-size: 11px; }
+  .stat-label { color: var(--muted); display: block; margin-bottom: 2px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .stat-val { font-weight: 600; }
+
+  .indicator-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .indicator { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+  .ind-green { background: var(--green-dim); color: var(--green); }
+  .ind-red   { background: var(--red-dim); color: var(--red); }
+  .ind-muted { background: var(--surface2); color: var(--muted); }
+  .ind-cyan  { background: #06b6d420; color: var(--cyan); }
+
+  .pair-actions { display: flex; gap: 8px; margin-top: 4px; }
+  .btn-sm { padding: 5px 12px; border-radius: var(--radius-sm); font-size: 11px; font-weight: 600; cursor: pointer; border: 1px solid var(--border); background: var(--surface2); color: var(--muted); transition: all 0.15s; }
+  .btn-sm:hover { border-color: var(--blue); color: var(--text); }
+  .btn-sm.danger:hover { border-color: var(--red); color: var(--red); }
+
+  /* Section */
+  .section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+  .section-head h2 { font-size: 14px; font-weight: 600; }
+  .refresh-btn { background: none; border: 1px solid var(--border); color: var(--muted); border-radius: var(--radius-sm); padding: 4px 10px; font-size: 11px; cursor: pointer; transition: all 0.15s; }
+  .refresh-btn:hover { border-color: var(--blue); color: var(--blue); }
+
+  /* Table */
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.6px; color: var(--muted); padding: 8px 12px; border-bottom: 1px solid var(--border); }
+  td { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: var(--surface2); }
+  .mono { font-family: monospace; font-size: 11px; color: var(--muted); }
+  .empty { text-align: center; color: var(--muted); padding: 28px; }
+
+  /* PnL chart */
+  .chart-wrap { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px; margin-top: 4px; }
+  .chart-wrap svg { display: block; width: 100%; }
+
+  .spin { display:inline-block; width:12px; height:12px; border:2px solid var(--border); border-top-color:var(--cyan); border-radius:50%; animation:spin .7s linear infinite; vertical-align:middle; }
+  @keyframes spin { to{transform:rotate(360deg)} }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-dot"></div>
+    <h1>Crypto Bot <span>multi-pair</span></h1>
+  </div>
+  <div class="header-right">
+    <span class="last-updated" id="lastUpdated">Loading…</span>
+    <button class="refresh-btn" onclick="load()">⟳ Refresh</button>
+  </div>
+</header>
+
+<main>
+
+  <!-- Aggregate stat cards -->
+  <div class="grid-4">
+    <div class="card">
+      <div class="card-title">Daily P&L</div>
+      <div class="card-value" id="aggDailyPnl">—</div>
+      <div class="card-sub" id="aggPairs">— pairs active</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Total Realized P&L</div>
+      <div class="card-value" id="aggTotalPnl">—</div>
+      <div class="card-sub" id="aggTrades">— trades total</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Win Rate</div>
+      <div class="card-value" id="aggWinRate">—</div>
+      <div class="card-sub">Across all pairs</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Open Positions</div>
+      <div class="card-value" id="aggPositions">—</div>
+      <div class="card-sub" id="aggInterval">— scan interval</div>
+    </div>
+  </div>
+
+  <!-- Per-pair cards -->
+  <div>
+    <div class="section-head">
+      <h2>Active Pairs</h2>
+    </div>
+    <div class="grid-auto" id="pairGrid">
+      <div class="card"><span class="spin"></span> Loading pairs…</div>
+    </div>
+  </div>
+
+  <!-- P&L chart -->
+  <div class="card">
+    <div class="section-head">
+      <h2>Cumulative P&L</h2>
+      <span style="font-size:11px;color:var(--muted)">From trade history</span>
+    </div>
+    <div class="chart-wrap">
+      <svg id="pnlChart" viewBox="0 0 600 100" height="100" preserveAspectRatio="none">
+        <text x="50%" y="55%" text-anchor="middle" fill="#7b8099" font-size="11">No trade data yet</text>
+      </svg>
+    </div>
+  </div>
+
+  <!-- Trade history -->
+  <div class="card">
+    <div class="section-head">
+      <h2>Recent Trades</h2>
+      <span id="tradeCountLabel" style="font-size:12px;color:var(--muted)">0 trades</span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Time</th><th>Pair</th><th>Action</th><th>Price</th><th>Qty</th><th>Value</th><th>P&L</th></tr>
+        </thead>
+        <tbody id="tradesBody">
+          <tr><td colspan="7" class="empty">No trades yet</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</main>
+
+<script>
+const BASE = window.location.pathname.replace(/\/[^/]*$/, '').replace(/\/$/, '');
+const api = p => fetch(BASE + p).then(r => r.json());
+
+function fmt$(v) {
+  if (v === null || v === undefined || isNaN(v)) return '—';
+  const abs = Math.abs(v);
+  const s = abs >= 1000 ? abs.toLocaleString('en-US', {maximumFractionDigits:2})
+          : abs < 1 ? abs.toFixed(6)
+          : abs.toFixed(4);
+  return (v < 0 ? '-' : '') + '$' + s;
+}
+function fmtPnl(v, tag=true) {
+  if (v === null || v === undefined || isNaN(v)) return '—';
+  const cls = v > 0 ? 'positive' : v < 0 ? 'negative' : 'neutral';
+  const str = (v >= 0 ? '+' : '') + '$' + Math.abs(v).toFixed(2);
+  return tag ? `<span class="${cls}">${str}</span>` : str;
+}
+function fmtTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+}
+
+function renderIndicator(label, cond, trueClass='ind-green', falseClass='ind-muted') {
+  return `<span class="indicator ${cond ? trueClass : falseClass}">${label}</span>`;
+}
+
+async function load() {
+  try {
+    const data = await api('/api/status');
+    const agg = data.aggregate;
+    const pairs = data.pairs;
+    const trades = data.recent_trades || [];
+
+    // Aggregate cards
+    const dpnl = agg.total_daily_pnl;
+    document.getElementById('aggDailyPnl').innerHTML =
+      `<span class="${dpnl>=0?'positive':'negative'}">${dpnl>=0?'+':''}$${Math.abs(dpnl).toFixed(2)}</span>`;
+    document.getElementById('aggPairs').textContent = `${agg.symbols.length} pair(s) active`;
+
+    const tpnl = agg.total_realized_pnl;
+    document.getElementById('aggTotalPnl').innerHTML =
+      `<span class="${tpnl>=0?'positive':'negative'}">${tpnl>=0?'+':''}$${Math.abs(tpnl).toFixed(2)}</span>`;
+    document.getElementById('aggTrades').textContent = `${agg.total_trades} trades total`;
+
+    document.getElementById('aggWinRate').textContent = agg.win_rate;
+    document.getElementById('aggPositions').textContent = agg.positions_open;
+    document.getElementById('aggInterval').textContent =
+      `${agg.interval} candles • scan ${agg.scan_secs}s • $${agg.budget_per_pair.toFixed(0)}/pair`;
+
+    // Pair cards
+    const grid = document.getElementById('pairGrid');
+    grid.innerHTML = '';
+    for (const [sym, st] of Object.entries(pairs)) {
+      const inPos = st.in_position;
+      const card = document.createElement('div');
+      card.className = `pair-card${inPos?' has-position':''}${st.paused?' paused':''}`;
+
+      const sigBadge = st.signal === 'buy'
+        ? '<span class="badge badge-green"><span class="badge-dot"></span>BUY</span>'
+        : st.signal === 'sell'
+        ? '<span class="badge badge-red"><span class="badge-dot"></span>SELL</span>'
+        : '<span class="badge badge-yellow"><span class="badge-dot"></span>HOLD</span>';
+
+      const priceFmt = st.price >= 1000
+        ? '$' + st.price.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})
+        : '$' + st.price.toFixed(4);
+
+      card.innerHTML = `
+        <div class="pair-header">
+          <span class="pair-symbol">${sym}</span>
+          ${sigBadge}
+        </div>
+        <div class="pair-price ${inPos ? 'positive' : 'neutral'}">${priceFmt}</div>
+        <div class="indicator-row">
+          ${renderIndicator('Uptrend', st.uptrend)}
+          ${renderIndicator(`RSI ${st.rsi.toFixed(1)}`, st.rsi < 50, st.rsi < 38 ? 'ind-green' : 'ind-muted', st.rsi > 62 ? 'ind-red' : 'ind-muted')}
+          ${renderIndicator(`MACD ${st.macd_hist >= 0 ? '+' : ''}${st.macd_hist.toFixed(3)}`, st.macd_hist > 0, 'ind-green', 'ind-red')}
+          ${renderIndicator(`Vol ${st.vol_ratio.toFixed(2)}x`, st.vol_ratio >= 0.8, 'ind-cyan', 'ind-muted')}
+        </div>
+        <div class="pair-stats">
+          <div class="stat-item">
+            <span class="stat-label">Daily P&L</span>
+            <span class="stat-val ${st.daily_pnl>=0?'positive':'negative'}">${st.daily_pnl>=0?'+':''}$${Math.abs(st.daily_pnl).toFixed(2)}</span>
+          </div>
+          ${inPos ? `
+          <div class="stat-item">
+            <span class="stat-label">Unrealized</span>
+            <span class="stat-val ${st.unrealized_pct>=0?'positive':'negative'}">${st.unrealized_pct>=0?'+':''}${st.unrealized_pct.toFixed(2)}%</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">Entry</span>
+            <span class="stat-val">${fmt$(st.entry_price)}</span>
+          </div>
+          ` : `
+          <div class="stat-item">
+            <span class="stat-label">Position</span>
+            <span class="stat-val" style="color:var(--muted)">None</span>
+          </div>
+          `}
+        </div>
+        <div class="pair-actions">
+          ${st.paused
+            ? `<button class="btn-sm" onclick="resumePair('${sym}')">▶ Resume</button>`
+            : `<button class="btn-sm danger" onclick="pausePair('${sym}')">⏸ Pause</button>`}
+        </div>
+        <div style="font-size:10px;color:var(--muted);margin-top:2px">
+          Last scan: ${st.last_scan ? fmtTime(st.last_scan) : '—'}
+        </div>
+      `;
+      grid.appendChild(card);
+    }
+
+    // Trade history table
+    document.getElementById('tradeCountLabel').textContent = `${trades.length} recent trades`;
+    const tbody = document.getElementById('tradesBody');
+    if (!trades.length) {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty">No trades yet</td></tr>';
+    } else {
+      tbody.innerHTML = trades.map(t => {
+        const isWin = t.action === 'sell' && t.pnl > 0;
+        const isLoss = t.action === 'sell' && t.pnl < 0;
+        return `<tr>
+          <td class="mono">${fmtTime(t.ts)}</td>
+          <td style="font-weight:600">${t.symbol}</td>
+          <td><span class="badge ${t.action==='buy'?'badge-green':'badge-red'}">${t.action.toUpperCase()}</span></td>
+          <td>${fmt$(t.price)}</td>
+          <td class="mono">${t.qty}</td>
+          <td>${fmt$(t.value)}</td>
+          <td>${t.action==='sell' ? fmtPnl(t.pnl) : '<span style="color:var(--muted)">—</span>'}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    // P&L chart
+    drawPnlChart(trades);
+
+    document.getElementById('lastUpdated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+  } catch(e) {
+    document.getElementById('lastUpdated').textContent = 'Error: ' + e.message;
+  }
+}
+
+function drawPnlChart(trades) {
+  const sells = trades.filter(t => t.action === 'sell').reverse();
+  if (sells.length < 2) return;
+
+  let cum = 0;
+  const points = sells.map(t => { cum += t.pnl || 0; return cum; });
+  const min = Math.min(...points, 0);
+  const max = Math.max(...points, 0);
+  const range = max - min || 1;
+  const W = 600, H = 100, PAD = 10;
+  const IW = W - PAD*2, IH = H - PAD*2;
+
+  const xs = points.map((_, i) => PAD + i / (points.length - 1) * IW);
+  const ys = points.map(p => PAD + IH - ((p - min) / range) * IH);
+  const zeroY = PAD + IH - ((0 - min) / range) * IH;
+
+  const pathD = xs.map((x, i) => `${i===0?'M':'L'}${x.toFixed(1)},${ys[i].toFixed(1)}`).join(' ');
+  const color = points[points.length-1] >= 0 ? '#22c55e' : '#ef4444';
+
+  // Area fill
+  const areaD = pathD + ` L${xs[xs.length-1].toFixed(1)},${zeroY.toFixed(1)} L${xs[0].toFixed(1)},${zeroY.toFixed(1)} Z`;
+
+  document.getElementById('pnlChart').innerHTML = `
+    <defs>
+      <linearGradient id="areaGrad" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="${color}" stop-opacity="0.3"/>
+        <stop offset="100%" stop-color="${color}" stop-opacity="0.02"/>
+      </linearGradient>
+    </defs>
+    <line x1="${PAD}" y1="${zeroY.toFixed(1)}" x2="${W-PAD}" y2="${zeroY.toFixed(1)}" stroke="#2a2d38" stroke-width="1" stroke-dasharray="3,3"/>
+    <path d="${areaD}" fill="url(#areaGrad)"/>
+    <path d="${pathD}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+  `;
+}
+
+async function pausePair(sym) {
+  await api(`/api/pause/${sym}`);
+  load();
+}
+
+async function resumePair(sym) {
+  await api(`/api/resume/${sym}`);
+  load();
+}
+
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>
