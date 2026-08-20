@@ -888,6 +888,8 @@ def format_alert(
         f"{risk_lines}\n\n"
         f"<b>Token</b>\n<code>{address}</code>\n"
         f'<a href="{link}">Open pool on GeckoTerminal</a>\n\n'
+        "<b>Manual max entry</b>\n"
+        "$20 maximum · alert-only, no order was placed\n\n"
         "This is a watchlist alert, not a buy call. Never risk money you "
         "cannot afford to lose."
     )
