@@ -109,6 +109,7 @@ class CryptoTrader:
         api_secret: str,
         symbol: str = "SOLUSDT",
         budget_usdt: float = 100.0,
+        recover_unmatched_position: bool = False,
     ):
         _DATA_DIR.mkdir(parents=True, exist_ok=True)
         self.symbol = symbol.upper()
@@ -125,6 +126,10 @@ class CryptoTrader:
         from binance.client import Client
         self.client = Client(api_key, api_secret, tld="us")
         self._filters = self._fetch_filters()
+        self.recovered_on_startup = False
+        if self.position is None and recover_unmatched_position:
+            self.position = self._recover_unmatched_position()
+            self.recovered_on_startup = self.position is not None
         logger.info(f"Trader ready: {self.symbol} | budget=${budget_usdt}")
         if self.position:
             logger.info(
@@ -189,6 +194,139 @@ class CryptoTrader:
             self._pos_file,
             asdict(self.position) if self.position else {},
         )
+
+    def _recover_unmatched_position(self) -> Optional[Position]:
+        """Recover buys after the latest sell before active workers may start."""
+        try:
+            raw_trades = self.client.get_my_trades(
+                symbol=self.symbol,
+                limit=1000,
+            )
+        except Exception as exc:
+            raise StateValidationError(
+                f"Could not read Binance trade history for {self.symbol}."
+            ) from exc
+        if not isinstance(raw_trades, list):
+            raise StateValidationError(
+                f"Binance trade history for {self.symbol} is malformed."
+            )
+
+        parsed: list[tuple[int, bool, float, float]] = []
+        for index, trade in enumerate(raw_trades):
+            if not isinstance(trade, dict) or not isinstance(
+                trade.get("isBuyer"), bool
+            ):
+                raise StateValidationError(
+                    f"Binance trade {index} for {self.symbol} is malformed."
+                )
+            try:
+                timestamp = int(trade["time"])
+                qty = float(trade["qty"])
+                quote_qty = float(trade["quoteQty"])
+                commission = float(trade.get("commission", 0))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise StateValidationError(
+                    f"Binance trade {index} for {self.symbol} is incomplete."
+                ) from exc
+            if (
+                timestamp <= 0
+                or not math.isfinite(qty)
+                or not math.isfinite(quote_qty)
+                or not math.isfinite(commission)
+                or qty <= 0
+                or quote_qty <= 0
+                or commission < 0
+            ):
+                raise StateValidationError(
+                    f"Binance trade {index} for {self.symbol} has invalid values."
+                )
+            commission_asset = str(trade.get("commissionAsset") or "").upper()
+            net_qty = (
+                qty - commission
+                if trade["isBuyer"] and commission_asset == self.base
+                else qty
+            )
+            net_quote_qty = (
+                quote_qty + commission
+                if trade["isBuyer"] and commission_asset == "USDT"
+                else quote_qty
+            )
+            if net_qty <= 0 or net_quote_qty <= 0:
+                raise StateValidationError(
+                    f"Binance trade {index} for {self.symbol} has invalid "
+                    "post-commission values."
+                )
+            parsed.append(
+                (timestamp, trade["isBuyer"], net_qty, net_quote_qty)
+            )
+
+        parsed.sort(key=lambda item: item[0])
+        last_sell_index = max(
+            (index for index, item in enumerate(parsed) if not item[1]),
+            default=-1,
+        )
+        if len(parsed) == 1000 and last_sell_index == -1:
+            raise StateValidationError(
+                f"Binance trade history for {self.symbol} is truncated before "
+                "the latest sell; recovery is ambiguous."
+            )
+        unmatched_buys = [
+            item for item in parsed[last_sell_index + 1:] if item[1]
+        ]
+        if not unmatched_buys:
+            logger.info("No unmatched Binance buys to recover for %s", self.symbol)
+            return None
+
+        bought_qty = sum(item[2] for item in unmatched_buys)
+        bought_value = sum(item[3] for item in unmatched_buys)
+        if bought_qty <= 0 or bought_value <= 0:
+            raise StateValidationError(
+                f"Recovered Binance totals for {self.symbol} are invalid."
+            )
+        _, actual_base = self.get_balances()
+        recoverable_qty = min(bought_qty, actual_base)
+        if recoverable_qty <= 0:
+            raise StateValidationError(
+                f"Binance shows unmatched buys for {self.symbol}, but no "
+                "recoverable base balance."
+            )
+
+        entry_price = bought_value / bought_qty
+        entry_value = entry_price * recoverable_qty
+        current_price = self.get_price()
+        if (
+            not math.isfinite(entry_price)
+            or not math.isfinite(entry_value)
+            or not math.isfinite(current_price)
+            or entry_price <= 0
+            or entry_value <= 0
+            or current_price <= 0
+        ):
+            raise StateValidationError(
+                f"Recovered Binance position for {self.symbol} is invalid."
+            )
+
+        self.position = Position(
+            symbol=self.symbol,
+            qty=recoverable_qty,
+            entry_price=entry_price,
+            entry_value=entry_value,
+            high_watermark=max(entry_price, current_price),
+        )
+        self._save_position()
+        self._record_trade(
+            "buy",
+            entry_price,
+            recoverable_qty,
+            entry_value,
+            reason="Recovered unmatched Binance fills during Railway migration",
+        )
+        logger.warning(
+            "Recovered unmatched Binance position for %s and persisted it "
+            "before worker activation",
+            self.symbol,
+        )
+        return self.position
 
     def _record_trade(self, action: str, price: float, qty: float, value: float,
                       pnl: float = 0.0, confidence: float = 0.0,

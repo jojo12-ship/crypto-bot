@@ -292,7 +292,7 @@ function fmt$(v) {
 function fmtPnl(v, tag=true) {
   if (v === null || v === undefined || isNaN(v)) return '—';
   const cls = v > 0 ? 'positive' : v < 0 ? 'negative' : 'neutral';
-  const str = (v >= 0 ? '+' : '') + '$' + Math.abs(v).toFixed(2);
+  const str = (v >= 0 ? '+' : '-') + '$' + Math.abs(v).toFixed(2);
   return tag ? `<span class="${cls}">${str}</span>` : str;
 }
 function fmtTime(iso) {
@@ -320,13 +320,11 @@ async function load() {
 
     // Aggregate cards
     const dpnl = agg.total_daily_pnl;
-    document.getElementById('aggDailyPnl').innerHTML =
-      `<span class="${dpnl>=0?'positive':'negative'}">${dpnl>=0?'+':''}$${Math.abs(dpnl).toFixed(2)}</span>`;
+    document.getElementById('aggDailyPnl').innerHTML = fmtPnl(dpnl);
     document.getElementById('aggPairs').textContent = `${agg.symbols.length} pair(s) active`;
 
     const tpnl = agg.total_realized_pnl;
-    document.getElementById('aggTotalPnl').innerHTML =
-      `<span class="${tpnl>=0?'positive':'negative'}">${tpnl>=0?'+':''}$${Math.abs(tpnl).toFixed(2)}</span>`;
+    document.getElementById('aggTotalPnl').innerHTML = fmtPnl(tpnl);
     document.getElementById('aggTrades').textContent = `${agg.total_trades} trades total`;
 
     document.getElementById('aggWinRate').textContent = agg.win_rate;
@@ -367,7 +365,7 @@ async function load() {
         <div class="pair-stats">
           <div class="stat-item">
             <span class="stat-label">Daily P&L</span>
-            <span class="stat-val ${st.daily_pnl>=0?'positive':'negative'}">${st.daily_pnl>=0?'+':''}$${Math.abs(st.daily_pnl).toFixed(2)}</span>
+            ${fmtPnl(st.daily_pnl)}
           </div>
           ${inPos ? `
           <div class="stat-item">

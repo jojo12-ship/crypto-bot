@@ -35,7 +35,7 @@ logger = logging.getLogger("main")
 
 from runtime_owner import current_runtime_ownership
 from singleton_lease import SingletonLease
-from state_store import configured_state_dir
+from state_store import configured_state_dir, position_recovery_marker_matches
 
 RUNTIME_OWNERSHIP = current_runtime_ownership()
 DESIGNATED_SERVICE = RUNTIME_OWNERSHIP.is_designated_service
@@ -91,6 +91,7 @@ class PairState:
 _pair_states: dict[str, PairState] = {s: PairState(symbol=s) for s in SYMBOLS}
 _traders: dict[str, object] = {}
 _state_lock = threading.Lock()
+_POSITION_RECOVERY_MARKER = STATE_DIR / "exchange-position-recovery-v1.json"
 
 # ── Telegram ───────────────────────────────────────────────────────────────────
 
@@ -205,13 +206,21 @@ def _trade_pair(symbol: str):
     st = _pair_states[symbol]
     MAX_BACKOFF = 60
     attempt = 0
+    trader = _traders.get(symbol)
 
     while True:
         attempt += 1
         try:
-            trader = CryptoTrader(API_KEY, API_SECRET, symbol=symbol, budget_usdt=BUDGET_PER_PAIR)
-            with _state_lock:
-                _traders[symbol] = trader
+            if trader is None:
+                trader = CryptoTrader(
+                    API_KEY,
+                    API_SECRET,
+                    symbol=symbol,
+                    budget_usdt=BUDGET_PER_PAIR,
+                    recover_unmatched_position=False,
+                )
+                with _state_lock:
+                    _traders[symbol] = trader
 
             notify.broadcast(
                 f"🤖 <b>Crypto Bot — {symbol}</b> started\n"
@@ -324,7 +333,47 @@ def _trade_pair(symbol: str):
             backoff = min(MAX_BACKOFF, 10 * attempt)
             logger.error(f"[{symbol}] Loop crashed: {exc}. Restarting in {backoff}s…")
             notify.broadcast(f"⚠️ {symbol} bot crashed: {exc}\nRestarting in {backoff}s…")
+            trader = None
             time.sleep(backoff)
+
+
+def _write_position_recovery_marker() -> None:
+    payload = {
+        "version": 1,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "symbols": sorted(set(SYMBOLS)),
+        "purpose": "one-time unmatched Binance fill recovery",
+    }
+    temp = _POSITION_RECOVERY_MARKER.with_suffix(".tmp")
+    with temp.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, _POSITION_RECOVERY_MARKER)
+
+
+def _prepare_active_traders() -> None:
+    recover_positions = not position_recovery_marker_matches(
+        _POSITION_RECOVERY_MARKER,
+        SYMBOLS,
+    )
+    prepared: dict[str, object] = {}
+    for symbol in SYMBOLS:
+        prepared[symbol] = CryptoTrader(
+            API_KEY,
+            API_SECRET,
+            symbol=symbol,
+            budget_usdt=BUDGET_PER_PAIR,
+            recover_unmatched_position=recover_positions,
+        )
+    if recover_positions:
+        _write_position_recovery_marker()
+        logger.info(
+            "Completed one-time Binance position recovery preflight for %s",
+            ", ".join(SYMBOLS),
+        )
+    with _state_lock:
+        _traders.update(prepared)
 
 
 def _start_active_workers() -> None:
@@ -368,9 +417,19 @@ def _ownership_supervisor() -> None:
         time.sleep(5)
 
     _active_lease = lease
+    _activation_state = "position_recovery_preflight"
+    logger.info("Singleton lease acquired; validating and recovering position state")
+    try:
+        _prepare_active_traders()
+    except Exception:
+        _activation_state = "blocked_position_recovery"
+        logger.exception(
+            "Active workers remain disabled because position recovery failed"
+        )
+        return
     _active_owner_event.set()
     _activation_state = "active"
-    logger.info("Singleton lease acquired; starting active Railway workers")
+    logger.info("Position preflight passed; starting active Railway workers")
     _start_active_workers()
 
 
@@ -461,8 +520,9 @@ async def resume_pair(symbol: str):
 @app.get("/crypto/health")
 async def health():
     meme_status = _meme_scanner.snapshot()
-    return {
-        "ok": True,
+    blocked = _activation_state.startswith("blocked_")
+    payload = {
+        "ok": not blocked,
         "runtime_owner": RUNTIME_OWNERSHIP.owner,
         "designated_service": DESIGNATED_SERVICE,
         "active_owner": _active_owner_event.is_set(),
@@ -479,6 +539,7 @@ async def health():
             "persistence_error": meme_status["persistence_error"],
         },
     }
+    return JSONResponse(payload, status_code=503 if blocked else 200)
 
 def _run_server():
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")

@@ -6,12 +6,16 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import notify
 import runtime_owner
 from singleton_lease import SingletonLease
-from state_store import StateStorageError, configured_state_dir
+from state_store import (
+    StateStorageError,
+    configured_state_dir,
+    position_recovery_marker_matches,
+)
 import trader
 
 
@@ -91,6 +95,37 @@ class RuntimeOwnerTests(unittest.TestCase):
                     }
                 )
 
+    def test_recovery_marker_requires_valid_current_symbol_set(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "exchange-position-recovery-v1.json"
+            marker.write_text("{not-json")
+            self.assertFalse(
+                position_recovery_marker_matches(
+                    marker,
+                    ["SOLUSDT", "ETHUSDT", "BTCUSDT"],
+                )
+            )
+            marker.write_text(
+                '{"version":1,"completed_at":"2026-08-20T00:00:00Z",'
+                '"symbols":["SOLUSDT","ETHUSDT"]}'
+            )
+            self.assertFalse(
+                position_recovery_marker_matches(
+                    marker,
+                    ["SOLUSDT", "ETHUSDT", "BTCUSDT"],
+                )
+            )
+            marker.write_text(
+                '{"version":1,"completed_at":"2026-08-20T00:00:00Z",'
+                '"symbols":["BTCUSDT","SOLUSDT","ETHUSDT"]}'
+            )
+            self.assertTrue(
+                position_recovery_marker_matches(
+                    marker,
+                    ["SOLUSDT", "ETHUSDT", "BTCUSDT"],
+                )
+            )
+
     def test_singleton_lease_allows_only_one_holder(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "owner.lock"
@@ -163,6 +198,82 @@ class RuntimeOwnerTests(unittest.TestCase):
             instance._pos_file = position_file
             with self.assertRaises(trader.StateValidationError):
                 instance._load_position()
+
+    def test_unmatched_buys_are_recovered_before_worker_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = trader.CryptoTrader.__new__(trader.CryptoTrader)
+            instance.symbol = "SOLUSDT"
+            instance.base = "SOL"
+            instance._pos_file = (
+                Path(directory) / "crypto_position_SOLUSDT.json"
+            )
+            instance._trades_file = (
+                Path(directory) / "crypto_trades_SOLUSDT.json"
+            )
+            instance.position = None
+            instance.client = Mock()
+            instance.client.get_my_trades.return_value = [
+                {
+                    "time": 1000,
+                    "isBuyer": False,
+                    "qty": "1",
+                    "quoteQty": "10",
+                },
+                {
+                    "time": 2000,
+                    "isBuyer": True,
+                    "qty": "1",
+                    "quoteQty": "10",
+                    "commission": "0.01",
+                    "commissionAsset": "SOL",
+                },
+                {
+                    "time": 3000,
+                    "isBuyer": True,
+                    "qty": "2",
+                    "quoteQty": "22",
+                },
+            ]
+            instance.client.get_account.return_value = {
+                "balances": [
+                    {"asset": "USDT", "free": "50", "locked": "0"},
+                    {"asset": "SOL", "free": "2.9", "locked": "0"},
+                ]
+            }
+            instance.client.get_symbol_ticker.return_value = {"price": "12"}
+
+            recovered = instance._recover_unmatched_position()
+
+            self.assertIsNotNone(recovered)
+            self.assertAlmostEqual(2.9, recovered.qty)
+            self.assertAlmostEqual(32 / 2.99, recovered.entry_price)
+            self.assertAlmostEqual((32 / 2.99) * 2.9, recovered.entry_value)
+            self.assertEqual(12, recovered.high_watermark)
+            saved = instance._load_position()
+            self.assertAlmostEqual(recovered.qty, saved.qty)
+            trades = instance._load_trades()
+            self.assertEqual(1, len(trades))
+            self.assertIn("Recovered unmatched Binance fills", trades[0]["reason"])
+
+    def test_ambiguous_truncated_history_blocks_position_recovery(self) -> None:
+        instance = trader.CryptoTrader.__new__(trader.CryptoTrader)
+        instance.symbol = "BTCUSDT"
+        instance.base = "BTC"
+        instance.client = Mock()
+        instance.client.get_my_trades.return_value = [
+            {
+                "time": index + 1,
+                "isBuyer": True,
+                "qty": "0.001",
+                "quoteQty": "50",
+            }
+            for index in range(1000)
+        ]
+        with self.assertRaisesRegex(
+            trader.StateValidationError,
+            "recovery is ambiguous",
+        ):
+            instance._recover_unmatched_position()
 
     def test_invalid_trade_history_aborts_before_binance_client(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
