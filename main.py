@@ -11,6 +11,8 @@ Optional env:
   CRYPTO_BUDGET_USDT  — total budget split across pairs (default: 100)
   CRYPTO_INTERVAL     — kline interval (default: 15m)
   CRYPTO_SCAN_SECS    — seconds between scans (default: 300)
+  MEME_SCAN_SECONDS   — seconds between Solana new-pool scans (default: 60)
+  CRYPTO_STATE_DIR    — persistent state directory (Railway volume preferred)
   PORT                — dashboard server port (default: 8004)
 """
 from __future__ import annotations
@@ -18,7 +20,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sys
 import threading
 import time
 from dataclasses import dataclass, field, asdict
@@ -32,19 +33,41 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
+from runtime_owner import current_runtime_ownership
+from singleton_lease import SingletonLease
+from state_store import configured_state_dir
+
+RUNTIME_OWNERSHIP = current_runtime_ownership()
+DESIGNATED_SERVICE = RUNTIME_OWNERSHIP.is_designated_service
+STATE_DIR, STATE_IS_DURABLE = configured_state_dir(
+    fallback_dir=Path(__file__).parent
+)
+os.environ.setdefault("CRYPTO_STATE_DIR", str(STATE_DIR))
+os.environ.setdefault("MEME_SCANNER_STATE_DIR", str(STATE_DIR))
+
 API_KEY    = os.getenv("BINANCE_API_KEY", "").strip()
 API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
-SYMBOLS    = [s.strip().upper() for s in os.getenv("CRYPTO_SYMBOLS", "SOLUSDT").split(",") if s.strip()]
+TELEGRAM_TOKEN = os.getenv("CRYPTO_BOT_TOKEN", "").strip()
+SYMBOLS    = [s.strip().upper() for s in os.getenv("CRYPTO_SYMBOLS", "SOLUSDT,BTCUSDT,ETHUSDT").split(",") if s.strip()]
 TOTAL_BUDGET = float(os.getenv("CRYPTO_BUDGET_USDT", "100"))
-INTERVAL   = os.getenv("CRYPTO_INTERVAL", "15m")
-SCAN_SECS  = int(os.getenv("CRYPTO_SCAN_SECS", "300"))
+INTERVAL   = os.getenv("CRYPTO_INTERVAL", "5m")
+SCAN_SECS  = int(os.getenv("CRYPTO_SCAN_SECS", "60"))
 PORT       = int(os.getenv("PORT", "8004"))
 
-if not API_KEY or not API_SECRET:
-    logger.error("BINANCE_API_KEY and BINANCE_API_SECRET must be set.")
-    sys.exit(1)
+if DESIGNATED_SERVICE and (not API_KEY or not API_SECRET or not TELEGRAM_TOKEN):
+    raise RuntimeError(
+        "The Railway crypto-bot service requires BINANCE_API_KEY, "
+        "BINANCE_API_SECRET, and CRYPTO_BOT_TOKEN."
+    )
+if not DESIGNATED_SERVICE:
+    logger.info("Health-only runtime: %s", RUNTIME_OWNERSHIP.reason)
 
 BUDGET_PER_PAIR = TOTAL_BUDGET / max(len(SYMBOLS), 1)
+_active_owner_event = threading.Event()
+_active_lease: SingletonLease | None = None
+_activation_state = (
+    "waiting_for_lease" if DESIGNATED_SERVICE else "health-only"
+)
 
 # ── Per-pair state ─────────────────────────────────────────────────────────────
 
@@ -72,9 +95,19 @@ _state_lock = threading.Lock()
 # ── Telegram ───────────────────────────────────────────────────────────────────
 
 import notify
+from meme_scanner import MemeScanner, ScannerConfig
+
+_meme_scanner = MemeScanner(
+    config=ScannerConfig.from_env(),
+    alert_callback=notify.broadcast,
+    delivery_enabled=False,
+)
 
 def _fmt_all_status() -> str:
-    lines = ["📊 <b>Crypto Bot Status</b>"]
+    lines = [
+        "📊 <b>Crypto Bot Status</b>",
+        f"Runtime: <b>{RUNTIME_OWNERSHIP.owner}</b>",
+    ]
     with _state_lock:
         for sym, st in _pair_states.items():
             emoji = "📈" if st.in_position else "⏳"
@@ -86,23 +119,72 @@ def _fmt_all_status() -> str:
                 + f"\n  Daily P&L: ${st.daily_pnl:+.2f}"
                 + (f"\n  ⏸ PAUSED" if st.paused else "")
             )
-    return "\n".join(lines)
+    return "\n".join(lines) + _meme_scanner.telegram_status()
 
 def _pause_all() -> str:
+    if not _active_owner_event.is_set():
+        return "ℹ️ This copy is health-only. Railway owns trading controls."
     with _state_lock:
         for st in _pair_states.values():
             st.paused = True
     return "⏸ All pairs paused."
 
 def _resume_all() -> str:
+    if not _active_owner_event.is_set():
+        return "ℹ️ This copy is health-only. Railway owns trading controls."
     with _state_lock:
         for st in _pair_states.values():
             st.paused = False
     return "▶️ All pairs resumed."
 
+def _fmt_daily_summary() -> str:
+    """Format a combined P&L summary across all pairs for Telegram."""
+    with _state_lock:
+        pairs_snap = {sym: asdict(st) for sym, st in _pair_states.items()}
+    total_pnl  = sum(st["daily_pnl"] for st in pairs_snap.values())
+    open_count = sum(1 for st in pairs_snap.values() if st["in_position"])
+
+    # Load all-time stats from trade logs
+    all_sells, all_wins = [], 0
+    for sym in SYMBOLS:
+        f = STATE_DIR / f"crypto_trades_{sym}.json"
+        if f.exists():
+            try:
+                trades = json.loads(f.read_text())
+                sells  = [t for t in trades if t.get("action") == "sell"]
+                all_sells.extend(sells)
+                all_wins += sum(1 for t in sells if t.get("pnl", 0) > 0)
+            except Exception:
+                pass
+    all_time_pnl = sum(t.get("pnl", 0) for t in all_sells)
+    wr = f"{all_wins / len(all_sells) * 100:.0f}%" if all_sells else "N/A"
+
+    pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
+    lines = [
+        f"📊 <b>Crypto Bot — Daily Summary</b>\n",
+        f"{pnl_emoji} Today P&amp;L: <b>${total_pnl:+.2f}</b>",
+        f"📈 All-time P&amp;L: ${all_time_pnl:+.2f}  |  Win rate: {wr}",
+        f"📂 Total trades: {len(all_sells)}",
+        f"🔓 Positions open: {open_count}",
+    ]
+    for sym, st in pairs_snap.items():
+        if st["in_position"]:
+            lines.append(f"  ↳ {sym} @ ${st['entry_price']:,.4f}  unrealized={st['unrealized_pct']:+.2f}%")
+    return "\n".join(lines)
+
+
+_last_summary_date: str = ""
+
 def _poll_loop():
+    global _last_summary_date
     while True:
         try:
+            # Daily summary when UTC date rolls over
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            if today != _last_summary_date and _last_summary_date != "":
+                notify.broadcast(_fmt_daily_summary())
+            _last_summary_date = today
+
             notify.poll_commands(
                 on_status=_fmt_all_status,
                 on_pause=_pause_all,
@@ -110,9 +192,7 @@ def _poll_loop():
             )
         except Exception as e:
             logger.debug(f"Poll error: {e}")
-        time.sleep(2)
-
-threading.Thread(target=_poll_loop, daemon=True).start()
+        time.sleep(5)
 
 # ── Trading loop (one per pair) ────────────────────────────────────────────────
 
@@ -198,31 +278,45 @@ def _trade_pair(symbol: str):
 
                 # ── Execute signal ───────────────────────────────────────────
                 if sig == "buy":
-                    result = trader.buy()
-                    msg = (
-                        f"🟢 <b>BUY {symbol}</b>\n"
-                        f"Price: ${result['price']:,.4f}\n"
-                        f"Qty: {result['qty']} {trader.base}\n"
-                        f"Spent: ${result['value']:.2f}\n"
-                        f"Reason: {reason}\n"
-                        f"🎯 TP: +3% | SL: -2% | Trail: -1.5% from peak"
-                    )
-                    notify.broadcast(msg)
+                    try:
+                        result = trader.buy(confidence=snap.confidence)
+                        msg = (
+                            f"🟢 <b>BUY {symbol}</b>\n"
+                            f"Price: ${result['price']:,.4f}\n"
+                            f"Qty: {result['qty']} {trader.base}\n"
+                            f"Spent: ${result['value']:.2f}\n"
+                            f"Confidence: {snap.confidence:.0%} → size scaled accordingly\n"
+                            f"Reason: {reason}\n"
+                            f"🎯 TP: +{snap.dynamic_tp:.1f}% | SL: -{snap.dynamic_sl:.1f}% | "
+                            f"Trail: -{snap.dynamic_trail:.1f}% from peak | Vol={snap.vol_pct:.2f}%/bar"
+                        )
+                        notify.broadcast(msg)
+                    except Exception as e:
+                        code = getattr(e, "code", None) or getattr(e, "status_code", None)
+                        logger.warning(f"[{symbol}] BUY skipped: {e}")
+                        if "-2010" in str(e) or code == -2010:
+                            notify.broadcast(f"⚠️ {symbol}: not enough USDT to buy — skipping this signal.")
+                        # Don't re-raise — just skip this signal and continue scanning
 
                 elif sig == "sell":
-                    result = trader.sell()
-                    pnl, pnl_pct = result["pnl"], result["pnl_pct"]
-                    with _state_lock:
-                        st.daily_pnl += pnl
-                    emoji = "💰" if pnl >= 0 else "🔴"
-                    msg = (
-                        f"{emoji} <b>SELL {symbol}</b>\n"
-                        f"Entry: ${result['entry']:,.4f} → Exit: ${result['price']:,.4f}\n"
-                        f"P&amp;L: ${pnl:+.2f} ({pnl_pct:+.2f}%)\n"
-                        f"Reason: {reason}\n"
-                        f"Daily P&amp;L: ${st.daily_pnl:+.2f}"
-                    )
-                    notify.broadcast(msg)
+                    try:
+                        result = trader.sell()
+                        pnl, pnl_pct = result["pnl"], result["pnl_pct"]
+                        with _state_lock:
+                            st.daily_pnl += pnl
+                        emoji = "💰" if pnl >= 0 else "🔴"
+                        msg = (
+                            f"{emoji} <b>SELL {symbol}</b>\n"
+                            f"Entry: ${result['entry']:,.4f} → Exit: ${result['price']:,.4f}\n"
+                            f"P&amp;L: ${pnl:+.2f} ({pnl_pct:+.2f}%)\n"
+                            f"Reason: {reason}\n"
+                            f"Daily P&amp;L: ${st.daily_pnl:+.2f}"
+                        )
+                        notify.broadcast(msg)
+                    except Exception as e:
+                        logger.warning(f"[{symbol}] SELL error: {e}")
+                        notify.broadcast(f"⚠️ {symbol} SELL failed: {e}")
+                        # Don't re-raise — position was already cleared if balance was 0
 
                 time.sleep(SCAN_SECS)
 
@@ -233,11 +327,59 @@ def _trade_pair(symbol: str):
             time.sleep(backoff)
 
 
-# Start one thread per pair
-for sym in SYMBOLS:
-    t = threading.Thread(target=_trade_pair, args=(sym,), daemon=True, name=f"trade-{sym}")
-    t.start()
-    logger.info(f"Started trading thread for {sym}")
+def _start_active_workers() -> None:
+    notify.set_delivery_enabled(True)
+    _meme_scanner.delivery_enabled = True
+    _meme_scanner.start()
+    threading.Thread(
+        target=_poll_loop,
+        daemon=True,
+        name="telegram-command-poller",
+    ).start()
+    logger.info("Railway Telegram command polling started")
+    for sym in SYMBOLS:
+        t = threading.Thread(
+            target=_trade_pair,
+            args=(sym,),
+            daemon=True,
+            name=f"trade-{sym}",
+        )
+        t.start()
+        logger.info(f"Started trading thread for {sym}")
+
+
+def _ownership_supervisor() -> None:
+    global _active_lease, _activation_state
+    if not DESIGNATED_SERVICE:
+        logger.info("Telegram, scanner delivery, and Binance workers are disabled")
+        return
+
+    delay = max(0, int(os.getenv("CRYPTO_OWNER_ACTIVATION_DELAY_SECS", "20")))
+    _activation_state = "activation_delay"
+    logger.info(
+        "Designated Railway service will seek the singleton lease in %ss",
+        delay,
+    )
+    time.sleep(delay)
+    lease = SingletonLease(STATE_DIR / "crypto-bot-owner.lock")
+    while not lease.try_acquire():
+        _activation_state = "waiting_for_lease"
+        logger.info("Another Railway instance owns active workers; standing by")
+        time.sleep(5)
+
+    _active_lease = lease
+    _active_owner_event.set()
+    _activation_state = "active"
+    logger.info("Singleton lease acquired; starting active Railway workers")
+    _start_active_workers()
+
+
+if not DESIGNATED_SERVICE:
+    for st in _pair_states.values():
+        st.status = "Health-only — Railway owns trading"
+else:
+    for st in _pair_states.values():
+        st.status = "Waiting for Railway ownership lease"
 
 # ── FastAPI dashboard ─────────────────────────────────────────────────────────
 
@@ -267,7 +409,7 @@ async def api_status():
     # Load all trades for summary
     all_trades: list[dict] = []
     for sym in SYMBOLS:
-        f = Path(f"crypto_trades_{sym}.json")
+        f = STATE_DIR / f"crypto_trades_{sym}.json"
         if f.exists():
             try:
                 trades = json.loads(f.read_text())
@@ -292,37 +434,63 @@ async def api_status():
             "interval": INTERVAL,
             "scan_secs": SCAN_SECS,
             "budget_per_pair": BUDGET_PER_PAIR,
+            "runtime_owner": RUNTIME_OWNERSHIP.owner,
+            "designated_service": DESIGNATED_SERVICE,
+            "active_owner": _active_owner_event.is_set(),
+            "activation_state": _activation_state,
+            "state_durable": STATE_IS_DURABLE,
         },
         "recent_trades": all_trades[:50],
+        "meme_scanner": _meme_scanner.snapshot(),
     })
 
 @app.get("/crypto/api/pause/{symbol}")
 async def pause_pair(symbol: str):
-    sym = symbol.upper()
-    if sym not in _pair_states:
-        return JSONResponse({"error": "Unknown symbol"}, status_code=404)
-    with _state_lock:
-        _pair_states[sym].paused = True
-    return {"symbol": sym, "paused": True}
+    return JSONResponse(
+        {"error": "Trading controls are available only to the Telegram owner"},
+        status_code=403,
+    )
 
 @app.get("/crypto/api/resume/{symbol}")
 async def resume_pair(symbol: str):
-    sym = symbol.upper()
-    if sym not in _pair_states:
-        return JSONResponse({"error": "Unknown symbol"}, status_code=404)
-    with _state_lock:
-        _pair_states[sym].paused = False
-    return {"symbol": sym, "paused": False}
+    return JSONResponse(
+        {"error": "Trading controls are available only to the Telegram owner"},
+        status_code=403,
+    )
 
 @app.get("/crypto/health")
 async def health():
-    return {"ok": True, "symbols": SYMBOLS}
+    meme_status = _meme_scanner.snapshot()
+    return {
+        "ok": True,
+        "runtime_owner": RUNTIME_OWNERSHIP.owner,
+        "designated_service": DESIGNATED_SERVICE,
+        "active_owner": _active_owner_event.is_set(),
+        "activation_state": _activation_state,
+        "telegram_delivery": _active_owner_event.is_set(),
+        "binance_trading": _active_owner_event.is_set(),
+        "state_dir": str(STATE_DIR),
+        "state_durable": STATE_IS_DURABLE,
+        "symbols": SYMBOLS,
+        "meme_scanner": {
+            "state": meme_status["state"],
+            "last_success": meme_status["last_success"],
+            "last_error": meme_status["last_error"],
+            "persistence_error": meme_status["persistence_error"],
+        },
+    }
 
 def _run_server():
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
 
 threading.Thread(target=_run_server, daemon=True).start()
 logger.info(f"Dashboard on port {PORT} at /crypto")
+
+threading.Thread(
+    target=_ownership_supervisor,
+    daemon=True,
+    name="ownership-supervisor",
+).start()
 
 def _keep_alive():
     import urllib.request
@@ -331,7 +499,6 @@ def _keep_alive():
         return
     urls = [
         f"https://{domain}/crypto/health",
-        f"https://{domain}/kalshi/health",
     ]
     while True:
         time.sleep(120)  # every 2 minutes

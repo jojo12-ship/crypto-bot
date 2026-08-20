@@ -110,6 +110,36 @@
   .chart-wrap { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px; margin-top: 4px; }
   .chart-wrap svg { display: block; width: 100%; }
 
+  /* Early-launch scanner */
+  .scanner-panel { border-color: #06b6d444; }
+  .scanner-note {
+    padding: 10px 12px; border-radius: var(--radius-sm);
+    background: #f59e0b12; border: 1px solid #f59e0b33;
+    color: #fbbf24; font-size: 12px; line-height: 1.5;
+  }
+  .scanner-stats {
+    display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr));
+    gap: 10px; margin: 14px 0;
+  }
+  .scanner-stat {
+    background: var(--surface2); border-radius: var(--radius-sm); padding: 12px;
+  }
+  .scanner-stat strong { display: block; font-size: 20px; margin-top: 4px; }
+  .scanner-reasons { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 16px; }
+  .scanner-reason {
+    padding: 4px 8px; border-radius: 5px; background: var(--surface2);
+    color: var(--muted); font-size: 11px;
+  }
+  .scanner-meta { color: var(--muted); font-size: 11px; line-height: 1.6; }
+  .scanner-link { color: var(--cyan); text-decoration: none; font-weight: 600; }
+  .scanner-link:hover { text-decoration: underline; }
+  .outcome-grid { display: grid; grid-template-columns: repeat(2, minmax(180px, 1fr)); gap: 10px; margin: 14px 0; }
+  .outcome-card { background: var(--surface2); border-radius: var(--radius-sm); padding: 12px; }
+  .outcome-card strong { display: block; font-size: 18px; margin: 4px 0; }
+  .outcome-detail { color: var(--muted); font-size: 11px; line-height: 1.6; }
+  @media(max-width:700px){ .outcome-grid{ grid-template-columns:1fr; } }
+  @media(max-width:700px){ .scanner-stats{ grid-template-columns:1fr 1fr; } }
+
   .spin { display:inline-block; width:12px; height:12px; border:2px solid var(--border); border-top-color:var(--cyan); border-radius:50%; animation:spin .7s linear infinite; vertical-align:middle; }
   @keyframes spin { to{transform:rotate(360deg)} }
 </style>
@@ -163,6 +193,52 @@
     </div>
   </div>
 
+  <!-- Early Solana launch scanner -->
+  <div class="card scanner-panel">
+    <div class="section-head">
+      <h2>Early Solana Launch Scanner</h2>
+      <span id="memeState" class="badge badge-cyan"><span class="badge-dot"></span>Starting</span>
+    </div>
+    <div class="scanner-note">
+      <b>Screened, still high risk.</b> This watcher looks for early buyer and
+      volume acceleration before a large move. It never places a meme-coin
+      trade and is kept separate from Binance positions and P&amp;L.
+    </div>
+    <div class="scanner-stats">
+      <div class="scanner-stat"><span class="stat-label">Pools Screened</span><strong id="memeScreened">—</strong></div>
+      <div class="scanner-stat"><span class="stat-label">Observed Now</span><strong id="memeObserved">—</strong></div>
+      <div class="scanner-stat"><span class="stat-label">Risk Checks</span><strong id="memeRiskChecks">—</strong></div>
+      <div class="scanner-stat"><span class="stat-label">Early Alerts</span><strong id="memeAlerts">—</strong></div>
+    </div>
+    <div class="scanner-meta" id="memeReason">Waiting for scanner status…</div>
+    <div class="scanner-meta" id="memeThresholds"></div>
+    <div class="scanner-reasons" id="memeRejections"></div>
+    <div class="section-head" style="margin-top:4px">
+      <h2>Read-Only Alert Outcomes</h2>
+      <span style="font-size:11px;color:var(--muted)">Price checks only — never included in trades or P&amp;L</span>
+    </div>
+    <div class="outcome-grid" id="memeOutcomes">
+      <div class="outcome-card"><span class="stat-label">15-minute result</span><strong>Waiting for alerts</strong></div>
+      <div class="outcome-card"><span class="stat-label">60-minute result</span><strong>Waiting for alerts</strong></div>
+    </div>
+    <div class="scanner-reasons" id="memeEvidence"></div>
+    <div class="scanner-meta" id="memeDecision"></div>
+    <div class="section-head" style="margin-top:4px">
+      <h2>Recent High-Risk Watch Alerts</h2>
+      <span style="font-size:11px;color:var(--muted)">Not included in trades or P&amp;L</span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Time</th><th>Token</th><th>Age</th><th>Liquidity</th><th>Buyers / Sellers</th><th>Acceleration</th><th>5m Move</th><th>Risk</th></tr>
+        </thead>
+        <tbody id="memeAlertsBody">
+          <tr><td colspan="8" class="empty">No early-launch alerts yet</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
   <!-- P&L chart -->
   <div class="card">
     <div class="section-head">
@@ -200,6 +276,11 @@
 const BASE = window.location.pathname.replace(/\/[^/]*$/, '').replace(/\/$/, '');
 const api = p => fetch(BASE + p).then(r => r.json());
 
+function esc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, ch => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+  })[ch]);
+}
 function fmt$(v) {
   if (v === null || v === undefined || isNaN(v)) return '—';
   const abs = Math.abs(v);
@@ -219,6 +300,11 @@ function fmtTime(iso) {
   const d = new Date(iso);
   return d.toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
 }
+function fmtAge(seconds) {
+  seconds = Math.max(0, Number(seconds) || 0);
+  if (seconds < 60) return `${Math.floor(seconds)}s`;
+  return `${Math.floor(seconds / 60)}m ${Math.floor(seconds % 60).toString().padStart(2,'0')}s`;
+}
 
 function renderIndicator(label, cond, trueClass='ind-green', falseClass='ind-muted') {
   return `<span class="indicator ${cond ? trueClass : falseClass}">${label}</span>`;
@@ -230,6 +316,7 @@ async function load() {
     const agg = data.aggregate;
     const pairs = data.pairs;
     const trades = data.recent_trades || [];
+    const meme = data.meme_scanner || {};
 
     // Aggregate cards
     const dpnl = agg.total_daily_pnl;
@@ -309,6 +396,85 @@ async function load() {
       `;
       grid.appendChild(card);
     }
+
+    // Early-launch scanner (separate from trade performance)
+    const scannerState = meme.state || 'unavailable';
+    const scannerError = ['source_error', 'persistence_error'].includes(scannerState);
+    const stateEl = document.getElementById('memeState');
+    stateEl.className = `badge ${scannerError ? 'badge-red' : scannerState === 'watching' ? 'badge-green' : 'badge-cyan'}`;
+    stateEl.innerHTML = `<span class="badge-dot"></span>${esc(scannerState.replaceAll('_', ' '))}`;
+    document.getElementById('memeScreened').textContent = meme.candidates_screened ?? 0;
+    document.getElementById('memeObserved').textContent = meme.observed_candidates ?? 0;
+    document.getElementById('memeRiskChecks').textContent = meme.risk_checks ?? 0;
+    document.getElementById('memeAlerts').textContent = meme.alerts_created ?? 0;
+    document.getElementById('memeReason').textContent =
+      `${meme.reason || 'Scanner status unavailable'}${meme.last_check ? ' • Last check ' + fmtTime(meme.last_check) : ''}`;
+
+    const mt = meme.thresholds || {};
+    document.getElementById('memeThresholds').textContent =
+      `Thresholds: ${mt.minimum_observations ?? '—'} observations • ` +
+      `${fmt$(mt.minimum_liquidity_usd)} minimum liquidity • ` +
+      `${mt.minimum_buyers ?? '—'} unique buyers • ` +
+      `maximum early move +${mt.maximum_price_gain_pct ?? '—'}% • ` +
+      `${mt.scan_seconds ?? '—'}s scan`;
+
+    const reasons = Object.entries(meme.rejection_reasons || {})
+      .sort((a,b) => b[1] - a[1]).slice(0, 8);
+    document.getElementById('memeRejections').innerHTML = reasons.length
+      ? reasons.map(([reason, count]) =>
+          `<span class="scanner-reason">${esc(reason.replaceAll('_',' '))}: ${Number(count)}</span>`
+        ).join('')
+      : '<span class="scanner-reason">No completed rejections yet</span>';
+
+    const outcomes = meme.outcomes || {};
+    const checkpoints = outcomes.checkpoints || {};
+    const fmtOutcome = (value) => value === null || value === undefined
+      ? '—' : `${Number(value) >= 0 ? '+' : ''}${Number(value).toFixed(1)}%`;
+    document.getElementById('memeOutcomes').innerHTML = ['15m', '60m'].map(key => {
+      const result = checkpoints[key] || {};
+      const rate = result.favorable_rate_pct;
+      const resolved = Number(result.resolved || 0);
+      const pending = Number(result.pending || 0);
+      const unavailable = Number(result.unavailable || 0);
+      return `<div class="outcome-card">
+        <span class="stat-label">${key} checkpoint (${outcomes.favorable_move_pct ?? '—'}% favorable move)</span>
+        <strong class="${rate === null || rate === undefined ? 'neutral' : rate >= 50 ? 'positive' : 'negative'}">${rate === null || rate === undefined ? 'Waiting for price' : `${rate.toFixed(1)}% favorable`}</strong>
+        <div class="outcome-detail">${resolved} resolved • ${pending} pending • ${unavailable} unavailable<br>
+          Avg move ${fmtOutcome(result.average_move_pct)} • Avg drawdown ${fmtOutcome(result.average_drawdown_pct)} • Worst move ${fmtOutcome(result.worst_move_pct)}</div>
+      </div>`;
+    }).join('');
+    const evidence = Object.entries(outcomes.by_qualification_evidence || {});
+    document.getElementById('memeEvidence').innerHTML = evidence.length
+      ? evidence.map(([label, checks]) => {
+          const fifteen = checks['15m'];
+          const hour = checks['60m'];
+          const summary = [fifteen && `15m ${fifteen.favorable_rate_pct}% (${fifteen.alerts})`,
+            hour && `60m ${hour.favorable_rate_pct}% (${hour.alerts})`].filter(Boolean).join(' • ');
+          return `<span class="scanner-reason">${esc(label)}: ${esc(summary)}</span>`;
+        }).join('')
+      : '<span class="scanner-reason">Qualification evidence will compare once checkpoints resolve</span>';
+    const readiness = outcomes.decision_readiness || {};
+    const drawdown = outcomes.drawdown || {};
+    document.getElementById('memeDecision').textContent =
+      `${readiness.guidance || 'Waiting for measured outcomes'} • ` +
+      `Cross-checkpoint avg max drawdown ${fmtOutcome(drawdown.average_max_drawdown_pct)} • ` +
+      `worst ${fmtOutcome(drawdown.worst_drawdown_pct)}`;
+
+    const memeAlerts = meme.recent_alerts || [];
+    const memeBody = document.getElementById('memeAlertsBody');
+    memeBody.innerHTML = memeAlerts.length ? memeAlerts.map(alert => {
+      const pool = encodeURIComponent(alert.pool_address || '');
+      return `<tr>
+        <td class="mono">${fmtTime(alert.created_at)}</td>
+        <td><a class="scanner-link" href="https://www.geckoterminal.com/solana/pools/${pool}" target="_blank" rel="noopener">${esc(alert.symbol)}</a><div class="mono">${esc((alert.token_address || '').slice(0,8))}…</div></td>
+        <td>${fmtAge(alert.pool_age_seconds)}</td>
+        <td>${fmt$(alert.liquidity_usd)}</td>
+        <td>${Number(alert.buyers_m5 || 0)} / ${Number(alert.sellers_m5 || 0)}</td>
+        <td>${Number(alert.buyer_acceleration_ratio || 0).toFixed(2)}x buyers<br>${Number(alert.volume_acceleration_ratio || 0).toFixed(2)}x volume</td>
+        <td class="${Number(alert.price_change_m5_pct)>=0?'positive':'negative'}">${Number(alert.price_change_m5_pct || 0)>=0?'+':''}${Number(alert.price_change_m5_pct || 0).toFixed(1)}%</td>
+        <td><span class="badge badge-yellow">High risk</span><div class="scanner-meta">No trade placed</div><div class="scanner-meta">15m ${fmtOutcome(alert.outcomes?.['15m']?.move_pct)} • 60m ${fmtOutcome(alert.outcomes?.['60m']?.move_pct)}</div></td>
+      </tr>`;
+    }).join('') : '<tr><td colspan="8" class="empty">No early-launch alerts yet</td></tr>';
 
     // Trade history table
     document.getElementById('tradeCountLabel').textContent = `${trades.length} recent trades`;

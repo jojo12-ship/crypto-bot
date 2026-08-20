@@ -6,13 +6,91 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger("trader")
 
-_DATA_DIR = Path(".")
+_DATA_DIR = Path(
+    os.getenv("CRYPTO_STATE_DIR", str(Path(__file__).parent))
+).expanduser().resolve()
+
+
+class StateValidationError(RuntimeError):
+    pass
+
+
+def _atomic_write_json(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    with temp.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, path)
+
+
+def _validated_position_payload(payload: object, symbol: str) -> dict:
+    if payload == {}:
+        return {}
+    if not isinstance(payload, dict):
+        raise StateValidationError("Position state must be a JSON object.")
+    required = {"symbol", "qty", "entry_price", "entry_value"}
+    if not required.issubset(payload):
+        raise StateValidationError("Position state is missing required fields.")
+    if str(payload["symbol"]).upper() != symbol:
+        raise StateValidationError("Position state belongs to a different symbol.")
+    for field_name in ("qty", "entry_price", "entry_value"):
+        try:
+            value = float(payload[field_name])
+        except (TypeError, ValueError) as exc:
+            raise StateValidationError(
+                f"Position field {field_name} is not numeric."
+            ) from exc
+        if value <= 0:
+            raise StateValidationError(
+                f"Position field {field_name} must be positive."
+            )
+    return payload
+
+
+def _validated_trade_payload(payload: object) -> list[dict]:
+    if not isinstance(payload, list) or any(
+        not isinstance(item, dict) for item in payload
+    ):
+        raise StateValidationError("Trade history must be a list of objects.")
+    required = {"ts", "action", "symbol", "price", "qty", "value", "pnl"}
+    for index, item in enumerate(payload):
+        if not required.issubset(item):
+            raise StateValidationError(
+                f"Trade record {index} is missing required fields."
+            )
+        if not isinstance(item["ts"], str) or not item["ts"].strip():
+            raise StateValidationError(
+                f"Trade record {index} has an invalid timestamp."
+            )
+        if item["action"] not in {"buy", "sell"}:
+            raise StateValidationError(
+                f"Trade record {index} has an invalid action."
+            )
+        if not isinstance(item["symbol"], str) or not item["symbol"].strip():
+            raise StateValidationError(
+                f"Trade record {index} has an invalid symbol."
+            )
+        for field_name in ("price", "qty", "value", "pnl"):
+            try:
+                value = float(item[field_name])
+            except (TypeError, ValueError) as exc:
+                raise StateValidationError(
+                    f"Trade record {index} field {field_name} is not numeric."
+                ) from exc
+            if field_name != "pnl" and value <= 0:
+                raise StateValidationError(
+                    f"Trade record {index} field {field_name} must be positive."
+                )
+    return payload
 
 
 @dataclass
@@ -32,11 +110,10 @@ class CryptoTrader:
         symbol: str = "SOLUSDT",
         budget_usdt: float = 100.0,
     ):
-        from binance.client import Client
+        _DATA_DIR.mkdir(parents=True, exist_ok=True)
         self.symbol = symbol.upper()
         self.base = self.symbol.replace("USDT", "")
         self.budget_usdt = budget_usdt
-        self.client = Client(api_key, api_secret, tld="us")
 
         # Per-symbol storage files
         self._pos_file = _DATA_DIR / f"crypto_position_{self.symbol}.json"
@@ -44,6 +121,9 @@ class CryptoTrader:
         self._migrate_legacy()
 
         self.position: Optional[Position] = self._load_position()
+        self._load_trades()
+        from binance.client import Client
+        self.client = Client(api_key, api_secret, tld="us")
         self._filters = self._fetch_filters()
         logger.info(f"Trader ready: {self.symbol} | budget=${budget_usdt}")
         if self.position:
@@ -55,15 +135,32 @@ class CryptoTrader:
     # ── Migration ─────────────────────────────────────────────────────────────
 
     def _migrate_legacy(self) -> None:
-        """Move legacy single-symbol files to symbol-scoped names."""
+        """Copy validated legacy state into the configured state directory."""
         if self.symbol == "SOLUSDT":
-            for legacy, new in [
-                (Path("crypto_position.json"), self._pos_file),
-                (Path("crypto_trades.json"), self._trades_file),
-            ]:
-                if legacy.exists() and not new.exists():
-                    legacy.rename(new)
-                    logger.info(f"Migrated {legacy} → {new}")
+            migrations = (
+                ("crypto_position.json", self._pos_file),
+                ("crypto_trades.json", self._trades_file),
+            )
+            for filename, new in migrations:
+                if new.exists():
+                    continue
+                candidates = (Path.cwd() / filename, Path(__file__).parent / filename)
+                for legacy in candidates:
+                    if legacy.resolve() == new.resolve() or not legacy.exists():
+                        continue
+                    try:
+                        payload = json.loads(legacy.read_text())
+                    except Exception as exc:
+                        raise StateValidationError(
+                            f"Could not read legacy state {legacy}."
+                        ) from exc
+                    if filename == "crypto_position.json":
+                        payload = _validated_position_payload(payload, self.symbol)
+                    else:
+                        payload = _validated_trade_payload(payload)
+                    _atomic_write_json(new, payload)
+                    logger.info("Copied legacy state %s → %s", legacy, new)
+                    break
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
@@ -71,26 +168,41 @@ class CryptoTrader:
         if not self._pos_file.exists():
             return None
         try:
-            d = json.loads(self._pos_file.read_text())
-            if d.get("symbol") == self.symbol and d.get("qty", 0) > 0:
-                return Position(**{k: d[k] for k in Position.__dataclass_fields__ if k in d})
-        except Exception:
-            pass
-        return None
+            payload = json.loads(self._pos_file.read_text())
+        except Exception as exc:
+            raise StateValidationError(
+                f"Could not read position state {self._pos_file}."
+            ) from exc
+        data = _validated_position_payload(payload, self.symbol)
+        if not data:
+            return None
+        return Position(
+            **{
+                key: data[key]
+                for key in Position.__dataclass_fields__
+                if key in data
+            }
+        )
 
     def _save_position(self) -> None:
-        if self.position:
-            self._pos_file.write_text(json.dumps(asdict(self.position)))
-        else:
-            self._pos_file.write_text("{}")
+        _atomic_write_json(
+            self._pos_file,
+            asdict(self.position) if self.position else {},
+        )
 
-    def _record_trade(self, action: str, price: float, qty: float, value: float, pnl: float = 0.0) -> None:
+    def _record_trade(self, action: str, price: float, qty: float, value: float,
+                      pnl: float = 0.0, confidence: float = 0.0,
+                      tp_pct: float = 0.0, sl_pct: float = 0.0, reason: str = "") -> None:
         trades = []
         if self._trades_file.exists():
             try:
-                trades = json.loads(self._trades_file.read_text())
-            except Exception:
-                pass
+                trades = _validated_trade_payload(
+                    json.loads(self._trades_file.read_text())
+                )
+            except Exception as exc:
+                raise StateValidationError(
+                    f"Could not read trade history {self._trades_file}."
+                ) from exc
         from datetime import datetime, timezone
         trades.append({
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -100,8 +212,12 @@ class CryptoTrader:
             "qty": qty,
             "value": round(value, 4),
             "pnl": round(pnl, 4),
+            "confidence": round(confidence, 3),
+            "tp_pct": round(tp_pct, 2),
+            "sl_pct": round(sl_pct, 2),
+            "reason": reason,
         })
-        self._trades_file.write_text(json.dumps(trades[-500:]))
+        _atomic_write_json(self._trades_file, trades[-500:])
 
     # ── Exchange helpers ──────────────────────────────────────────────────────
 
@@ -170,16 +286,25 @@ class CryptoTrader:
         if not self._trades_file.exists():
             return []
         try:
-            return json.loads(self._trades_file.read_text())
-        except Exception:
-            return []
+            return _validated_trade_payload(
+                json.loads(self._trades_file.read_text())
+            )
+        except Exception as exc:
+            raise StateValidationError(
+                f"Could not read trade history {self._trades_file}."
+            ) from exc
 
     # ── Order execution ───────────────────────────────────────────────────────
 
-    def buy(self, usdt_amount: float | None = None) -> dict:
+    def buy(self, usdt_amount: float | None = None, confidence: float = 0.5) -> dict:
         usdt_bal, _ = self.get_balances()
         if usdt_amount is None:
-            usdt_amount = min(self.budget_usdt * 0.95, usdt_bal * 0.95)
+            # Dynamic position sizing: scale between 30% and 95% of budget by confidence.
+            # Low confidence (0.0) → 30% | High confidence (1.0) → 95%
+            # This means weak signals get small positions; strong setups get full capital.
+            scale = 0.30 + 0.65 * min(1.0, max(0.0, confidence))
+            usdt_amount = min(self.budget_usdt * scale, usdt_bal * 0.95)
+            logger.info(f"[{self.symbol}] Sizing: confidence={confidence:.2f} → scale={scale:.0%} → ${usdt_amount:.2f}")
 
         min_notional = self._min_notional()
         if usdt_amount < min_notional:
@@ -198,17 +323,28 @@ class CryptoTrader:
             high_watermark=avg_price,
         )
         self._save_position()
-        self._record_trade("buy", avg_price, qty, value)
-        logger.info(f"BUY {qty} {self.base} @ ${avg_price:.4f} (${value:.2f})")
-        return {"qty": qty, "price": avg_price, "value": value}
+        self._record_trade("buy", avg_price, qty, value, confidence=confidence)
+        logger.info(f"BUY {qty} {self.base} @ ${avg_price:.4f} (${value:.2f}) conf={confidence:.2f}")
+        return {"qty": qty, "price": avg_price, "value": value, "confidence": confidence}
 
     def sell(self) -> dict:
         if not self.position:
             raise ValueError("No open position")
 
-        sell_qty = self._round_qty(self.position.qty)
+        # Use the actual exchange balance — fees/slippage make stored qty slightly higher
+        _, actual_base = self.get_balances()
+        safe_qty = min(self.position.qty, actual_base)
+        sell_qty = self._round_qty(safe_qty)
         if sell_qty < self._min_qty():
-            raise ValueError(f"Qty {sell_qty} below min {self._min_qty()}")
+            # Nothing sellable — clear stale position and bail
+            logger.warning(
+                f"Sell qty {sell_qty} below min {self._min_qty()} "
+                f"(stored={self.position.qty}, actual={actual_base:.6f}). "
+                f"Clearing stale position."
+            )
+            self.position = None
+            self._save_position()
+            raise ValueError(f"No sellable balance for {self.symbol} — position cleared")
 
         order = self.client.order_market_sell(symbol=self.symbol, quantity=sell_qty)
         qty = float(order["executedQty"])
