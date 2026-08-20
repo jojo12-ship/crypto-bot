@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import notify
+from order_gate import OrderPermissionError, SynchronizedOrderGate
 import runtime_owner
 from singleton_lease import SingletonLease
 from state_store import (
@@ -188,6 +189,58 @@ class RuntimeOwnerTests(unittest.TestCase):
                 self.assertIn('"pnl": -2.0', instance._trades_file.read_text())
             finally:
                 trader._DATA_DIR = original
+
+    def test_unhealthy_telegram_gate_blocks_all_binance_orders(self) -> None:
+        gate = SynchronizedOrderGate(lambda: False)
+        gate.set_enabled(True)
+        guarded_trader = object.__new__(trader.CryptoTrader)
+        guarded_trader._order_allowed = gate.is_allowed
+        guarded_trader._order_submitter = gate.submit
+        guarded_trader.client = Mock()
+
+        with self.assertRaises(OrderPermissionError):
+            guarded_trader.buy(usdt_amount=20)
+        with self.assertRaises(OrderPermissionError):
+            guarded_trader.sell()
+
+        guarded_trader.client.order_market_buy.assert_not_called()
+        guarded_trader.client.order_market_sell.assert_not_called()
+
+    def test_order_submission_and_permission_revocation_are_serialized(self) -> None:
+        import threading
+
+        healthy = True
+        gate = SynchronizedOrderGate(lambda: healthy)
+        gate.set_enabled(True)
+        order_started = threading.Event()
+        release_order = threading.Event()
+        revocation_finished = threading.Event()
+
+        def order_call() -> dict:
+            order_started.set()
+            self.assertTrue(release_order.wait(timeout=2))
+            return {"executedQty": "1", "cummulativeQuoteQty": "10"}
+
+        order_thread = threading.Thread(target=lambda: gate.submit(order_call))
+        order_thread.start()
+        self.assertTrue(order_started.wait(timeout=2))
+
+        def revoke() -> None:
+            nonlocal healthy
+            healthy = False
+            gate.set_enabled(False)
+            revocation_finished.set()
+
+        revoke_thread = threading.Thread(target=revoke)
+        revoke_thread.start()
+        self.assertFalse(revocation_finished.wait(timeout=0.1))
+
+        release_order.set()
+        order_thread.join(timeout=2)
+        revoke_thread.join(timeout=2)
+        self.assertTrue(revocation_finished.is_set())
+        with self.assertRaises(OrderPermissionError):
+            gate.submit(lambda: {})
 
     def test_invalid_existing_position_state_aborts_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

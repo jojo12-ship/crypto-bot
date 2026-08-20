@@ -9,7 +9,9 @@ import math
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
+
+from order_gate import OrderPermissionError
 
 logger = logging.getLogger("trader")
 
@@ -110,11 +112,15 @@ class CryptoTrader:
         symbol: str = "SOLUSDT",
         budget_usdt: float = 100.0,
         recover_unmatched_position: bool = False,
+        order_allowed: Callable[[], bool] | None = None,
+        order_submitter: Callable[[Callable[[], dict]], dict] | None = None,
     ):
         _DATA_DIR.mkdir(parents=True, exist_ok=True)
         self.symbol = symbol.upper()
         self.base = self.symbol.replace("USDT", "")
         self.budget_usdt = budget_usdt
+        self._order_allowed = order_allowed
+        self._order_submitter = order_submitter
 
         # Per-symbol storage files
         self._pos_file = _DATA_DIR / f"crypto_position_{self.symbol}.json"
@@ -434,7 +440,20 @@ class CryptoTrader:
 
     # ── Order execution ───────────────────────────────────────────────────────
 
+    def _require_order_permission(self) -> None:
+        if self._order_allowed is not None and not self._order_allowed():
+            raise OrderPermissionError(
+                "Binance order blocked because Telegram polling is not healthy"
+            )
+
+    def _submit_order(self, order_call: Callable[[], dict]) -> dict:
+        if self._order_submitter is not None:
+            return self._order_submitter(order_call)
+        self._require_order_permission()
+        return order_call()
+
     def buy(self, usdt_amount: float | None = None, confidence: float = 0.5) -> dict:
+        self._require_order_permission()
         usdt_bal, _ = self.get_balances()
         if usdt_amount is None:
             # Dynamic position sizing: scale between 30% and 95% of budget by confidence.
@@ -448,7 +467,12 @@ class CryptoTrader:
         if usdt_amount < min_notional:
             raise ValueError(f"Amount ${usdt_amount:.2f} below exchange minimum (${min_notional})")
 
-        order = self.client.order_market_buy(symbol=self.symbol, quoteOrderQty=round(usdt_amount, 2))
+        order = self._submit_order(
+            lambda: self.client.order_market_buy(
+                symbol=self.symbol,
+                quoteOrderQty=round(usdt_amount, 2),
+            )
+        )
         qty = float(order["executedQty"])
         value = float(order["cummulativeQuoteQty"])
         avg_price = value / qty if qty else 0
@@ -466,6 +490,7 @@ class CryptoTrader:
         return {"qty": qty, "price": avg_price, "value": value, "confidence": confidence}
 
     def sell(self) -> dict:
+        self._require_order_permission()
         if not self.position:
             raise ValueError("No open position")
 
@@ -484,7 +509,12 @@ class CryptoTrader:
             self._save_position()
             raise ValueError(f"No sellable balance for {self.symbol} — position cleared")
 
-        order = self.client.order_market_sell(symbol=self.symbol, quantity=sell_qty)
+        order = self._submit_order(
+            lambda: self.client.order_market_sell(
+                symbol=self.symbol,
+                quantity=sell_qty,
+            )
+        )
         qty = float(order["executedQty"])
         value = float(order["cummulativeQuoteQty"])
         avg_price = value / qty if qty else 0

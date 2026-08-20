@@ -27,6 +27,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from order_gate import SynchronizedOrderGate
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -97,6 +99,18 @@ _POSITION_RECOVERY_MARKER = STATE_DIR / "exchange-position-recovery-v1.json"
 
 import notify
 from meme_scanner import MemeScanner, ScannerConfig
+
+
+def _base_order_permission() -> bool:
+    return bool(
+        DESIGNATED_SERVICE
+        and _active_owner_event.is_set()
+        and _active_lease is not None
+        and notify.telegram_health_snapshot()["polling_healthy"]
+    )
+
+
+_order_gate = SynchronizedOrderGate(_base_order_permission)
 
 _meme_scanner = MemeScanner(
     config=ScannerConfig.from_env(),
@@ -186,11 +200,20 @@ def _poll_loop():
                 notify.broadcast(_fmt_daily_summary())
             _last_summary_date = today
 
-            notify.poll_commands(
+            poll_succeeded = notify.poll_commands(
                 on_status=_fmt_all_status,
                 on_pause=_pause_all,
                 on_resume=_resume_all,
             )
+            if poll_succeeded:
+                if _active_owner_event.is_set() and _active_lease is not None:
+                    _order_gate.set_enabled(True)
+            else:
+                if _order_gate.is_allowed():
+                    logger.error(
+                        "Telegram polling failed; Binance order permission revoked"
+                    )
+                _order_gate.set_enabled(False)
         except Exception as e:
             logger.debug(f"Poll error: {e}")
         time.sleep(5)
@@ -201,6 +224,11 @@ import strategy
 from trader import CryptoTrader
 
 DAILY_LOSS_LIMIT_PCT = 0.10   # pause pair at -10% of its budget
+
+
+def _orders_allowed() -> bool:
+    return _order_gate.is_allowed()
+
 
 def _trade_pair(symbol: str):
     st = _pair_states[symbol]
@@ -218,6 +246,8 @@ def _trade_pair(symbol: str):
                     symbol=symbol,
                     budget_usdt=BUDGET_PER_PAIR,
                     recover_unmatched_position=False,
+                    order_allowed=_orders_allowed,
+                    order_submitter=_order_gate.submit,
                 )
                 with _state_lock:
                     _traders[symbol] = trader
@@ -229,6 +259,10 @@ def _trade_pair(symbol: str):
             daily_loss_limit = BUDGET_PER_PAIR * DAILY_LOSS_LIMIT_PCT
 
             while True:
+                if not _orders_allowed():
+                    st.status = "⛔ Trading blocked — Telegram polling is unhealthy"
+                    time.sleep(5)
+                    continue
                 with _state_lock:
                     paused = st.paused
                     daily_pnl = st.daily_pnl
@@ -365,6 +399,8 @@ def _prepare_active_traders() -> None:
             symbol=symbol,
             budget_usdt=BUDGET_PER_PAIR,
             recover_unmatched_position=recover_positions,
+            order_allowed=_orders_allowed,
+            order_submitter=_order_gate.submit,
         )
     if recover_positions:
         _write_position_recovery_marker()
@@ -377,7 +413,6 @@ def _prepare_active_traders() -> None:
 
 
 def _start_active_workers() -> None:
-    notify.set_delivery_enabled(True)
     _meme_scanner.delivery_enabled = True
     _meme_scanner.start()
     threading.Thread(
@@ -417,17 +452,34 @@ def _ownership_supervisor() -> None:
         time.sleep(5)
 
     _active_lease = lease
-    _activation_state = "position_recovery_preflight"
-    logger.info("Singleton lease acquired; validating and recovering position state")
+    _activation_state = "telegram_preflight"
+    logger.info("Singleton lease acquired; validating Telegram polling")
     try:
+        notify.set_delivery_enabled(True)
+        telegram_username = notify.validate_configuration()
+        if not notify.poll_commands(
+            on_status=_fmt_all_status,
+            on_pause=_pause_all,
+            on_resume=_resume_all,
+            timeout_seconds=0,
+        ):
+            telegram_status = notify.telegram_health_snapshot()
+            raise RuntimeError(
+                telegram_status["last_error"]
+                or "Telegram polling preflight did not succeed"
+            )
+        logger.info("Telegram polling preflight passed for @%s", telegram_username)
+        _activation_state = "position_recovery_preflight"
         _prepare_active_traders()
     except Exception:
-        _activation_state = "blocked_position_recovery"
+        notify.set_delivery_enabled(False)
+        _activation_state = "blocked_activation_preflight"
         logger.exception(
-            "Active workers remain disabled because position recovery failed"
+            "Active workers remain disabled because activation preflight failed"
         )
         return
     _active_owner_event.set()
+    _order_gate.set_enabled(True)
     _activation_state = "active"
     logger.info("Position preflight passed; starting active Railway workers")
     _start_active_workers()
@@ -520,15 +572,24 @@ async def resume_pair(symbol: str):
 @app.get("/crypto/health")
 async def health():
     meme_status = _meme_scanner.snapshot()
-    blocked = _activation_state.startswith("blocked_")
+    telegram_status = notify.telegram_health_snapshot()
+    telegram_unhealthy = (
+        _active_owner_event.is_set()
+        and not _orders_allowed()
+    )
+    blocked = _activation_state.startswith("blocked_") or telegram_unhealthy
     payload = {
         "ok": not blocked,
         "runtime_owner": RUNTIME_OWNERSHIP.owner,
         "designated_service": DESIGNATED_SERVICE,
         "active_owner": _active_owner_event.is_set(),
         "activation_state": _activation_state,
-        "telegram_delivery": _active_owner_event.is_set(),
-        "binance_trading": _active_owner_event.is_set(),
+        "telegram_delivery": (
+            _active_owner_event.is_set()
+            and telegram_status["polling_healthy"]
+        ),
+        "telegram": telegram_status,
+        "binance_trading": _orders_allowed(),
         "state_dir": str(STATE_DIR),
         "state_durable": STATE_IS_DURABLE,
         "symbols": SYMBOLS,
