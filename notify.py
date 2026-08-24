@@ -5,8 +5,10 @@ Also handles the /status, /pause, /resume command bot.
 from __future__ import annotations
 
 import logging
+import html
 import json
 import os
+import queue
 import re
 import threading
 import time
@@ -23,14 +25,21 @@ _BASE = f"https://api.telegram.org/bot{TOKEN}"
 
 _lock = threading.Lock()
 _health_lock = threading.Lock()
+_status_render_lock = threading.Lock()
 _last_poll_success_monotonic: float | None = None
 _last_poll_error: str | None = None
 _consecutive_poll_failures = 0
+_status_render_inflight = False
 _state_dir = Path(
     os.getenv("CRYPTO_STATE_DIR", str(Path(__file__).parent))
 ).expanduser().resolve()
 _state_file = _state_dir / "crypto_notify_state.json"
 _delivery_enabled = False
+_STATUS_KEYBOARD = {
+    "keyboard": [[{"text": "📊 Status"}]],
+    "resize_keyboard": True,
+    "is_persistent": True,
+}
 
 
 def _load_state() -> tuple[set[int], int]:
@@ -108,6 +117,108 @@ def _post(method: str, **kwargs) -> dict:
         }
 
 
+def _plain_text(html_text: str) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", "", html_text))
+
+
+def _send_command_reply(
+    chat_id: int,
+    text: str,
+    *,
+    parse_mode: str | None = None,
+    reply_markup: dict | None = None,
+) -> bool:
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+    }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    response = _post("sendMessage", **payload)
+    if response.get("ok") is True:
+        return True
+
+    description = response.get("description") or "Telegram rejected the command reply"
+    logger.warning("Telegram command reply failed: %s", description)
+    if not parse_mode:
+        return False
+
+    fallback = _post(
+        "sendMessage",
+        chat_id=chat_id,
+        text=_plain_text(text),
+        reply_markup=reply_markup,
+    )
+    if fallback.get("ok") is True:
+        logger.warning("Telegram command reply succeeded after plain-text fallback")
+        return True
+    logger.warning(
+        "Telegram plain-text command reply failed: %s",
+        fallback.get("description") or "unknown Telegram error",
+    )
+    return False
+
+
+def _render_status(on_status: Callable, timeout_seconds: float = 5.0) -> str:
+    global _status_render_inflight
+    with _status_render_lock:
+        if _status_render_inflight:
+            logger.error("Telegram status formatter is still busy after a timeout")
+            return (
+                "⚠️ Crypto Bot status is temporarily unavailable, but command polling "
+                "is active. Binance orders remain safety-gated."
+            )
+        _status_render_inflight = True
+    result_queue: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
+
+    def render() -> None:
+        global _status_render_inflight
+        try:
+            result_queue.put((True, on_status()))
+        except Exception as exc:
+            result_queue.put((False, exc))
+        finally:
+            with _status_render_lock:
+                _status_render_inflight = False
+
+    threading.Thread(
+        target=render,
+        daemon=True,
+        name="telegram-status-renderer",
+    ).start()
+    try:
+        succeeded, result = result_queue.get(timeout=timeout_seconds)
+    except queue.Empty:
+        logger.error("Telegram status formatter timed out")
+        return (
+            "⚠️ Crypto Bot status is temporarily unavailable, but command polling "
+            "is active. Binance orders remain safety-gated."
+        )
+    if not succeeded:
+        logger.error(
+            "Telegram status formatter failed: %s",
+            result,
+            exc_info=(
+                type(result),
+                result,
+                result.__traceback__,
+            ) if isinstance(result, BaseException) else None,
+        )
+        return (
+            "⚠️ Crypto Bot status is temporarily unavailable, but command polling "
+            "is active. Binance orders remain safety-gated."
+        )
+    if not isinstance(result, str) or not result.strip():
+        logger.error("Telegram status formatter returned an empty response")
+        return (
+            "⚠️ Crypto Bot status is temporarily unavailable, but command polling "
+            "is active. Binance orders remain safety-gated."
+        )
+    return result
+
+
 def validate_configuration() -> str:
     """Verify the configured token before active workers are allowed to start."""
     response = _post("getMe")
@@ -172,10 +283,19 @@ def broadcast(text: str) -> int:
             text=text,
             parse_mode="HTML",
             disable_web_page_preview=True,
+            reply_markup=_STATUS_KEYBOARD,
         )
         if response.get("ok") is True:
             delivered += 1
     return delivered
+
+
+def send_status_keyboard() -> int:
+    """Show subscribed chats the read-only status control."""
+    return broadcast(
+        "🤖 <b>Crypto Trading Bot</b>\n\n"
+        "Tap <b>📊 Status</b> below for current positions and P&amp;L."
+    )
 
 
 def poll_commands(
@@ -216,30 +336,43 @@ def poll_commands(
                 subscribed = chat_id in _subscribers
                 _save_state_locked()
             if not subscribed:
-                _post(
-                    "sendMessage",
+                if not _send_command_reply(
                     chat_id=chat_id,
                     text="Send /start first to subscribe.",
-                )
+                ):
+                    _record_poll_failure("Telegram could not send the subscription reply")
+                    return False
                 continue
             if text in ("/start", "start"):
-                _post("sendMessage", chat_id=chat_id, parse_mode="HTML",
-                      text="🤖 <b>Crypto Trading Bot</b>\n\nYou're registered for trade alerts.\n\n"
-                           "/status — current position & P&amp;L")
-            elif text in ("/status", "status"):
-                _post("sendMessage", chat_id=chat_id, parse_mode="HTML", text=on_status())
+                reply_sent = _send_command_reply(
+                    chat_id=chat_id,
+                    parse_mode="HTML",
+                    text="🤖 <b>Crypto Trading Bot</b>\n\nYou're registered for trade alerts.\n\n"
+                         "Tap <b>📊 Status</b> below for current positions and P&amp;L.",
+                    reply_markup=_STATUS_KEYBOARD,
+                )
+            elif text in ("/status", "status", "📊 status"):
+                reply_sent = _send_command_reply(
+                    chat_id=chat_id,
+                    parse_mode="HTML",
+                    text=_render_status(on_status),
+                    reply_markup=_STATUS_KEYBOARD,
+                )
             elif text in ("/pause", "pause"):
-                _post(
-                    "sendMessage",
+                reply_sent = _send_command_reply(
                     chat_id=chat_id,
                     text="Trading controls are disabled for safety.",
                 )
             elif text in ("/resume", "resume"):
-                _post(
-                    "sendMessage",
+                reply_sent = _send_command_reply(
                     chat_id=chat_id,
                     text="Trading controls are disabled for safety.",
                 )
+            else:
+                reply_sent = True
+            if not reply_sent:
+                _record_poll_failure("Telegram could not send the command reply")
+                return False
         _record_poll_success()
         return True
     except Exception as e:
