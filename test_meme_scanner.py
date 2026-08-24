@@ -33,6 +33,7 @@ def pool_payload(
     liquidity: float = 8_000,
     price_change: float = 8,
     price_usd: float = 0.0000123,
+    market_cap: float | None = 100_000,
 ) -> dict:
     return {
         "data": [
@@ -45,6 +46,9 @@ def pool_payload(
                     "pool_created_at": BASE_TIME.isoformat().replace("+00:00", "Z"),
                     "base_token_price_usd": str(price_usd),
                     "reserve_in_usd": str(liquidity),
+                    "market_cap_usd": (
+                        str(market_cap) if market_cap is not None else None
+                    ),
                     "price_change_percentage": {
                         "m5": str(price_change),
                         "h1": str(price_change),
@@ -170,10 +174,79 @@ class MemeScannerLogicTests(unittest.TestCase):
     def test_rejects_pool_that_already_pumped(self) -> None:
         observations = qualifying_observations(self.config)
         observations[-1]["price_change_m5_pct"] = 48
+        observations[-1]["market_cap_usd"] = 2_000_000
         result = evaluate_momentum(observations, self.config)
         self.assertFalse(result.qualified)
         self.assertTrue(result.hard_rejection)
-        self.assertEqual("already_pumped", result.reason)
+        self.assertEqual("breakout_market_cap_too_high", result.reason)
+
+    def test_accepts_cate_like_breakout_before_one_million_market_cap(self) -> None:
+        observations = []
+        fixtures = [
+            (100, 20, 6, 25, 7, 8_000, 55, 70_000),
+            (160, 29, 7, 36, 9, 14_000, 68, 85_000),
+            (220, 42, 8, 53, 10, 28_000, 82, 120_000),
+        ]
+        for age, buyers, sellers, buys, sells, volume, gain, market_cap in fixtures:
+            pool = parse_gecko_pools(
+                pool_payload(
+                    buyers=buyers,
+                    sellers=sellers,
+                    buys=buys,
+                    sells=sells,
+                    volume=volume,
+                    liquidity=15_000,
+                    price_change=gain,
+                    market_cap=market_cap,
+                ),
+                now=BASE_TIME + timedelta(seconds=age),
+            )[0]
+            observations.append(pool.observation())
+
+        result = evaluate_momentum(observations, self.config)
+        self.assertTrue(result.qualified)
+        self.assertEqual("qualified_low_cap_breakout", result.reason)
+        self.assertEqual("low_cap_breakout", result.metrics["signal_tier"])
+        self.assertEqual(120_000, result.metrics["market_cap_usd"])
+
+    def test_fast_breakout_without_market_cap_fails_closed(self) -> None:
+        observations = qualifying_observations(self.config)
+        observations[-1]["price_change_m5_pct"] = 60
+        observations[-1]["market_cap_usd"] = 0
+        result = evaluate_momentum(observations, self.config)
+        self.assertFalse(result.qualified)
+        self.assertTrue(result.hard_rejection)
+        self.assertEqual("market_cap_unavailable", result.reason)
+
+    def test_fast_breakout_with_nonfinite_market_cap_fails_closed(self) -> None:
+        observations = qualifying_observations(self.config)
+        observations[-1]["price_change_m5_pct"] = 60
+        observations[-1]["market_cap_usd"] = float("nan")
+        result = evaluate_momentum(observations, self.config)
+        self.assertFalse(result.qualified)
+        self.assertTrue(result.hard_rejection)
+        self.assertEqual("market_cap_unavailable", result.reason)
+
+    def test_breakout_configuration_must_stay_stricter_than_normal(self) -> None:
+        weaker_overrides = (
+            {"breakout_min_liquidity_usd": self.config.min_liquidity_usd},
+            {"breakout_min_buyers": self.config.min_buyers},
+            {"breakout_min_volume_m5_usd": self.config.min_volume_m5_usd},
+            {"breakout_min_buy_sell_ratio": self.config.min_buy_sell_ratio},
+            {"max_breakout_price_gain_pct": self.config.max_price_gain_pct},
+        )
+        for override in weaker_overrides:
+            with self.subTest(override=override):
+                with self.assertRaisesRegex(
+                    ValueError, "invalid low-cap breakout configuration"
+                ):
+                    ScannerConfig(**override)
+
+    def test_breakout_configuration_rejects_nonfinite_thresholds(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "thresholds must be finite and nonnegative"
+        ):
+            ScannerConfig(max_breakout_market_cap_usd=float("nan"))
 
     def test_rejects_activity_one_wallet_can_manufacture(self) -> None:
         observations = qualifying_observations(self.config)
@@ -320,6 +393,40 @@ class MemeScannerLogicTests(unittest.TestCase):
         self.assertIn("GeckoTerminal", alert)
         self.assertIn("M&lt;EME", alert)
         self.assertNotIn("M<EME", alert)
+
+    def test_breakout_alert_is_labeled_and_shows_early_market_cap(self) -> None:
+        candidate = {
+            "symbol": "CATE-LIKE",
+            "token_address": TOKEN,
+            "pool_address": POOL,
+            "observations": [],
+        }
+        for age, buyers, sellers, buys, sells, volume, gain, market_cap in [
+            (100, 20, 6, 25, 7, 8_000, 55, 70_000),
+            (160, 29, 7, 36, 9, 14_000, 68, 85_000),
+            (220, 42, 8, 53, 10, 28_000, 82, 120_000),
+        ]:
+            pool = parse_gecko_pools(
+                pool_payload(
+                    buyers=buyers,
+                    sellers=sellers,
+                    buys=buys,
+                    sells=sells,
+                    volume=volume,
+                    liquidity=15_000,
+                    price_change=gain,
+                    market_cap=market_cap,
+                ),
+                now=BASE_TIME + timedelta(seconds=age),
+            )[0]
+            candidate["observations"].append(pool.observation())
+        momentum = evaluate_momentum(candidate["observations"], self.config)
+        risk = screen_risk_report(safe_risk_report(), POOL, self.config)
+        alert = format_alert(candidate, momentum, risk)
+        self.assertIn("LOW-CAP SOLANA BREAKOUT", alert)
+        self.assertIn("CATE-LIKE FLOW", alert)
+        self.assertIn("Market cap: <b>$120,000</b>", alert)
+        self.assertIn("below the $1M breakout ceiling", alert)
 
     def test_fast_pump_estimate_is_conservative_and_requires_screen_pass(self) -> None:
         observations = qualifying_observations(self.config)

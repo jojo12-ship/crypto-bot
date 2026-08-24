@@ -84,6 +84,12 @@ class ScannerConfig:
     min_buy_sell_ratio: float = 1.20
     max_buys_per_buyer: float = 3.5
     max_price_gain_pct: float = 35
+    max_breakout_price_gain_pct: float = 250
+    max_breakout_market_cap_usd: float = 1_000_000
+    breakout_min_liquidity_usd: float = 8_000
+    breakout_min_buyers: int = 20
+    breakout_min_volume_m5_usd: float = 5_000
+    breakout_min_buy_sell_ratio: float = 1.50
     max_price_drop_pct: float = 25
     max_non_pool_holder_pct: float = 20
     max_top5_non_pool_pct: float = 50
@@ -102,6 +108,60 @@ class ScannerConfig:
     max_outcome_attempts: int = 5
     min_outcome_sample_size: int = 20
     request_timeout_seconds: int = 20
+
+    def __post_init__(self) -> None:
+        numeric_fields = {
+            "min_liquidity_usd": self.min_liquidity_usd,
+            "min_volume_m5_usd": self.min_volume_m5_usd,
+            "min_buy_sell_ratio": self.min_buy_sell_ratio,
+            "max_price_gain_pct": self.max_price_gain_pct,
+            "max_breakout_price_gain_pct": self.max_breakout_price_gain_pct,
+            "max_breakout_market_cap_usd": self.max_breakout_market_cap_usd,
+            "breakout_min_liquidity_usd": self.breakout_min_liquidity_usd,
+            "breakout_min_volume_m5_usd": self.breakout_min_volume_m5_usd,
+            "breakout_min_buy_sell_ratio": self.breakout_min_buy_sell_ratio,
+        }
+        invalid = [
+            name
+            for name, value in numeric_fields.items()
+            if not math.isfinite(float(value)) or float(value) < 0
+        ]
+        if invalid:
+            raise ValueError(
+                "scanner thresholds must be finite and nonnegative: "
+                + ", ".join(invalid)
+            )
+        stronger_breakout_checks = (
+            (
+                self.max_breakout_price_gain_pct > self.max_price_gain_pct,
+                "maximum breakout price gain must exceed the normal price ceiling",
+            ),
+            (
+                self.max_breakout_market_cap_usd > 0,
+                "maximum breakout market cap must be positive",
+            ),
+            (
+                self.breakout_min_liquidity_usd > self.min_liquidity_usd,
+                "breakout liquidity minimum must exceed the normal minimum",
+            ),
+            (
+                self.breakout_min_buyers > self.min_buyers,
+                "breakout buyer minimum must exceed the normal minimum",
+            ),
+            (
+                self.breakout_min_volume_m5_usd > self.min_volume_m5_usd,
+                "breakout volume minimum must exceed the normal minimum",
+            ),
+            (
+                self.breakout_min_buy_sell_ratio > self.min_buy_sell_ratio,
+                "breakout flow ratio must exceed the normal minimum",
+            ),
+        )
+        violations = [
+            message for passed, message in stronger_breakout_checks if not passed
+        ]
+        if violations:
+            raise ValueError("invalid low-cap breakout configuration: " + "; ".join(violations))
 
     @classmethod
     def from_env(cls) -> "ScannerConfig":
@@ -134,6 +194,30 @@ class ScannerConfig:
             max_price_gain_pct=number(
                 "MEME_MAX_PRICE_GAIN_PCT", cls.max_price_gain_pct
             ),
+            max_breakout_price_gain_pct=number(
+                "MEME_MAX_BREAKOUT_PRICE_GAIN_PCT",
+                cls.max_breakout_price_gain_pct,
+            ),
+            max_breakout_market_cap_usd=number(
+                "MEME_MAX_BREAKOUT_MARKET_CAP_USD",
+                cls.max_breakout_market_cap_usd,
+            ),
+            breakout_min_liquidity_usd=number(
+                "MEME_BREAKOUT_MIN_LIQUIDITY_USD",
+                cls.breakout_min_liquidity_usd,
+            ),
+            breakout_min_buyers=integer(
+                "MEME_BREAKOUT_MIN_BUYERS",
+                cls.breakout_min_buyers,
+            ),
+            breakout_min_volume_m5_usd=number(
+                "MEME_BREAKOUT_MIN_VOLUME_M5_USD",
+                cls.breakout_min_volume_m5_usd,
+            ),
+            breakout_min_buy_sell_ratio=number(
+                "MEME_BREAKOUT_MIN_BUY_SELL_RATIO",
+                cls.breakout_min_buy_sell_ratio,
+            ),
             max_price_drop_pct=number(
                 "MEME_MAX_PRICE_DROP_PCT", cls.max_price_drop_pct
             ),
@@ -157,6 +241,12 @@ class ScannerConfig:
             "minimum_new_buyers_latest_scan": self.min_latest_new_buyers,
             "minimum_m5_volume_usd": self.min_volume_m5_usd,
             "maximum_price_gain_pct": self.max_price_gain_pct,
+            "maximum_breakout_price_gain_pct": self.max_breakout_price_gain_pct,
+            "maximum_breakout_market_cap_usd": self.max_breakout_market_cap_usd,
+            "breakout_minimum_liquidity_usd": self.breakout_min_liquidity_usd,
+            "breakout_minimum_buyers": self.breakout_min_buyers,
+            "breakout_minimum_m5_volume_usd": self.breakout_min_volume_m5_usd,
+            "breakout_minimum_buy_sell_ratio": self.breakout_min_buy_sell_ratio,
             "cooldown_seconds": self.cooldown_seconds,
             "maximum_tracked_candidates": self.max_tracked_candidates,
             "outcome_checkpoints_minutes": list(self.outcome_checkpoint_minutes),
@@ -178,6 +268,7 @@ class PoolSnapshot:
     age_seconds: float
     price_usd: float
     liquidity_usd: float
+    market_cap_usd: float
     volume_m5_usd: float
     price_change_m5_pct: float
     price_change_h1_pct: float
@@ -192,6 +283,7 @@ class PoolSnapshot:
             "age_seconds": round(self.age_seconds, 2),
             "price_usd": self.price_usd,
             "liquidity_usd": round(self.liquidity_usd, 2),
+            "market_cap_usd": round(self.market_cap_usd, 2),
             "volume_m5_usd": round(self.volume_m5_usd, 2),
             "price_change_m5_pct": round(self.price_change_m5_pct, 3),
             "price_change_h1_pct": round(self.price_change_h1_pct, 3),
@@ -207,7 +299,7 @@ class MomentumResult:
     qualified: bool
     reason: str
     detail: str
-    metrics: dict[str, float]
+    metrics: dict[str, Any]
     hard_rejection: bool = False
 
 
@@ -283,6 +375,10 @@ def parse_gecko_pools(
                     age_seconds=max(0.0, age),
                     price_usd=_num(attrs.get("base_token_price_usd")),
                     liquidity_usd=_num(attrs.get("reserve_in_usd")),
+                    market_cap_usd=_num(
+                        attrs.get("market_cap_usd"),
+                        _num(attrs.get("fdv_usd")),
+                    ),
                     volume_m5_usd=_num(volumes.get("m5")),
                     price_change_m5_pct=_num(changes.get("m5")),
                     price_change_h1_pct=_num(changes.get("h1")),
@@ -331,6 +427,7 @@ def evaluate_momentum(
         )
 
     liquidity = _num(latest.get("liquidity_usd"))
+    market_cap = _num(latest.get("market_cap_usd"))
     gain = _num(latest.get("price_change_m5_pct"))
     buyers = int(_num(latest.get("buyers_m5")))
     sellers = int(_num(latest.get("sellers_m5")))
@@ -338,16 +435,62 @@ def evaluate_momentum(
     sells = int(_num(latest.get("sells_m5")))
     volume = _num(latest.get("volume_m5_usd"))
 
+    breakout_window = False
+    if gain > config.max_price_gain_pct:
+        if not math.isfinite(market_cap) or market_cap <= 0:
+            return MomentumResult(
+                False,
+                "market_cap_unavailable",
+                "Market cap/FDV is required for a fast-breakout alert",
+                {},
+                True,
+            )
+        if market_cap > config.max_breakout_market_cap_usd:
+            return MomentumResult(
+                False,
+                "breakout_market_cap_too_high",
+                (
+                    f"${market_cap:,.0f} market cap exceeds the "
+                    f"${config.max_breakout_market_cap_usd:,.0f} early-alert ceiling"
+                ),
+                {},
+                True,
+            )
+        if gain > config.max_breakout_price_gain_pct:
+            return MomentumResult(
+                False,
+                "already_pumped",
+                f"{gain:+.1f}% in 5m",
+                {},
+                True,
+            )
+        breakout_window = True
+
+    required_liquidity = (
+        config.breakout_min_liquidity_usd
+        if breakout_window
+        else config.min_liquidity_usd
+    )
+    required_buyers = (
+        config.breakout_min_buyers
+        if breakout_window
+        else config.min_buyers
+    )
+    required_volume = (
+        config.breakout_min_volume_m5_usd
+        if breakout_window
+        else config.min_volume_m5_usd
+    )
+    required_flow_ratio = (
+        config.breakout_min_buy_sell_ratio
+        if breakout_window
+        else config.min_buy_sell_ratio
+    )
     hard_checks = [
         (
-            liquidity >= config.min_liquidity_usd,
+            liquidity >= required_liquidity,
             "liquidity_too_low",
-            f"${liquidity:,.0f} liquidity",
-        ),
-        (
-            gain <= config.max_price_gain_pct,
-            "already_pumped",
-            f"{gain:+.1f}% in 5m",
+            f"${liquidity:,.0f} liquidity; need ${required_liquidity:,.0f}",
         ),
         (
             gain >= -config.max_price_drop_pct,
@@ -355,22 +498,22 @@ def evaluate_momentum(
             f"{gain:+.1f}% in 5m",
         ),
         (
-            buyers >= config.min_buyers,
+            buyers >= required_buyers,
             "not_enough_unique_buyers",
-            f"{buyers} buyers",
+            f"{buyers} buyers; need {required_buyers}",
         ),
         (
-            volume >= config.min_volume_m5_usd,
+            volume >= required_volume,
             "volume_too_low",
-            f"${volume:,.0f} in 5m",
+            f"${volume:,.0f} in 5m; need ${required_volume:,.0f}",
         ),
         (
-            buys / max(sells, 1) >= config.min_buy_sell_ratio,
+            buys / max(sells, 1) >= required_flow_ratio,
             "buy_flow_not_dominant",
             f"{buys} buys vs {sells} sells",
         ),
         (
-            buyers / max(sellers, 1) >= config.min_buy_sell_ratio,
+            buyers / max(sellers, 1) >= required_flow_ratio,
             "buyer_count_not_dominant",
             f"{buyers} buyers vs {sellers} sellers",
         ),
@@ -420,6 +563,10 @@ def evaluate_momentum(
             latest_volume_delta / max(previous_volume_delta, 1), 2
         ),
         "buy_sell_ratio": round(buys / max(sells, 1), 2),
+        "market_cap_usd": round(market_cap, 2),
+        "signal_tier": (
+            "low_cap_breakout" if breakout_window else "early_acceleration"
+        ),
     }
     if latest_buyer_delta < needed_buyers:
         return MomentumResult(
@@ -438,10 +585,19 @@ def evaluate_momentum(
 
     return MomentumResult(
         True,
-        "qualified_momentum",
+        (
+            "qualified_low_cap_breakout"
+            if breakout_window
+            else "qualified_momentum"
+        ),
         (
             f"+{latest_buyer_delta} buyers and +${latest_volume_delta:,.0f} "
             "volume on latest scan"
+            + (
+                f"; ${market_cap:,.0f} market cap low-cap breakout"
+                if breakout_window
+                else ""
+            )
         ),
         metrics,
     )
@@ -865,13 +1021,26 @@ def format_alert(
         f"• {html.escape(check)}" for check in risk_checks
     )
     fast_pump_chance = estimate_fast_pump_chance_pct(latest, momentum, risk)
+    breakout = momentum.metrics.get("signal_tier") == "low_cap_breakout"
+    heading = (
+        "🔥 <b>LOW-CAP SOLANA BREAKOUT — CATE-LIKE FLOW</b>"
+        if breakout
+        else "🚨 <b>EARLY SOLANA LAUNCH — WATCHLIST</b>"
+    )
+    breakout_note = (
+        " · below the $1M breakout ceiling"
+        if breakout
+        else ""
+    )
     return (
-        "🚨 <b>EARLY SOLANA LAUNCH — WATCHLIST</b>\n"
+        f"{heading}\n"
         "⚠️ <b>Screened, still high risk</b> · <b>No trade was placed</b>\n\n"
         f"<b>{symbol}</b> · Solana · Pool age "
         f"{_duration(_num(latest.get('age_seconds')))}\n"
-        f"Liquidity: <b>${_num(latest.get('liquidity_usd')):,.0f}</b> "
-        f"· 5m: {_num(latest.get('price_change_m5_pct')):+.1f}%\n\n"
+        f"Liquidity: <b>${_num(latest.get('liquidity_usd')):,.0f}</b> · "
+        f"Market cap: <b>${_num(latest.get('market_cap_usd')):,.0f}</b>\n"
+        f"5m price: {_num(latest.get('price_change_m5_pct')):+.1f}%"
+        f"{breakout_note}\n\n"
         "<b>Why it made the watchlist</b>\n"
         f"• Buyers / sellers (5m): "
         f"{int(_num(latest.get('buyers_m5')))} / "
@@ -1064,11 +1233,20 @@ class MemeScanner:
             age = _num(latest.get("age_seconds"))
             liquidity = _num(latest.get("liquidity_usd"))
             gain = _num(latest.get("price_change_m5_pct"))
+            market_cap = _num(latest.get("market_cap_usd"))
             buyers = int(_num(latest.get("buyers_m5")))
+            breakout_trackable = (
+                gain > self.config.max_price_gain_pct
+                and gain <= self.config.max_breakout_price_gain_pct
+                and 0 < market_cap <= self.config.max_breakout_market_cap_usd
+            )
             if (
                 age > self.config.max_age_seconds
                 or liquidity < self.config.min_liquidity_usd * 0.5
-                or gain > self.config.max_price_gain_pct
+                or (
+                    gain > self.config.max_price_gain_pct
+                    and not breakout_trackable
+                )
                 or gain < -self.config.max_price_drop_pct
                 or buyers < 2
             ):
@@ -1167,12 +1345,16 @@ class MemeScanner:
             "pool_age_seconds": latest["age_seconds"],
             "entry_price_usd": latest["price_usd"],
             "liquidity_usd": latest["liquidity_usd"],
+            "market_cap_usd": latest.get("market_cap_usd", 0),
             "buyers_m5": latest["buyers_m5"],
             "sellers_m5": latest["sellers_m5"],
             "buys_m5": latest["buys_m5"],
             "sells_m5": latest["sells_m5"],
             "volume_m5_usd": latest["volume_m5_usd"],
             "price_change_m5_pct": latest["price_change_m5_pct"],
+            "signal_tier": momentum.metrics.get(
+                "signal_tier", "early_acceleration"
+            ),
             "buyer_acceleration_ratio": momentum.metrics[
                 "buyer_acceleration_ratio"
             ],
@@ -1204,6 +1386,11 @@ class MemeScanner:
         buyer_ratio = momentum.metrics["buyer_acceleration_ratio"]
         volume_ratio = momentum.metrics["volume_acceleration_ratio"]
         return [
+            (
+                "low-cap breakout tier"
+                if momentum.metrics.get("signal_tier") == "low_cap_breakout"
+                else "early acceleration tier"
+            ),
             (
                 "buyer acceleration ≥1.5x"
                 if buyer_ratio >= 1.5
