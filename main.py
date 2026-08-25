@@ -18,6 +18,7 @@ Optional env:
 from __future__ import annotations
 
 import json
+import hmac
 import logging
 import os
 import threading
@@ -494,7 +495,7 @@ else:
 
 # ── FastAPI dashboard ─────────────────────────────────────────────────────────
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
@@ -554,6 +555,31 @@ async def api_status():
         "recent_trades": all_trades[:50],
         "meme_scanner": _meme_scanner.snapshot(),
     })
+
+@app.get("/crypto/api/meme-outcomes")
+async def meme_outcomes(
+    authorization: str | None = Header(default=None),
+    limit: int = Query(default=500, ge=1, le=500),
+):
+    review_token = os.getenv("MEME_REVIEW_TOKEN", "").strip()
+    if not review_token:
+        raise HTTPException(
+            status_code=503,
+            detail="Meme outcome review access is not configured",
+        )
+    scheme, separator, credential = (authorization or "").partition(" ")
+    authorized = (
+        separator == " "
+        and scheme.lower() == "bearer"
+        and bool(credential)
+        and hmac.compare_digest(credential, review_token)
+    )
+    if not authorized:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return JSONResponse(
+        _meme_scanner.outcome_review(limit=limit),
+        headers={"Cache-Control": "no-store"},
+    )
 
 @app.get("/crypto/api/pause/{symbol}")
 async def pause_pair(symbol: str):

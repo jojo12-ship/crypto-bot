@@ -692,6 +692,68 @@ class MemeScannerPersistenceTests(unittest.TestCase):
             result["recent_alerts"][0]["outcomes"]["15m"]["status"],
         )
 
+    def test_outcome_review_is_allowlisted_read_only_projection(self) -> None:
+        scanner = self.scanner()
+        scanner.scan_once(
+            pools_payload=pool_payload(
+                buyers=8, sellers=3, buys=10, sells=4, volume=1_000
+            ),
+            now=BASE_TIME + timedelta(seconds=100),
+        )
+        scanner.scan_once(
+            pools_payload=pool_payload(
+                buyers=11, sellers=4, buys=14, sells=5, volume=1_300
+            ),
+            now=BASE_TIME + timedelta(seconds=160),
+        )
+        alerted_at = BASE_TIME + timedelta(seconds=220)
+        scanner.scan_once(
+            pools_payload=pool_payload(
+                buyers=15,
+                sellers=5,
+                buys=19,
+                sells=6,
+                volume=1_800,
+            ),
+            risk_reports={TOKEN: safe_risk_report()},
+            now=alerted_at,
+        )
+        scanner.scan_once(
+            pools_payload=pool_payload(
+                buyers=16,
+                sellers=5,
+                buys=20,
+                sells=6,
+                volume=2_000,
+            ),
+            outcome_payload=pool_payload(
+                buyers=16,
+                sellers=5,
+                buys=20,
+                sells=6,
+                volume=2_000,
+                price_usd=0.000014,
+            ),
+            now=alerted_at + timedelta(minutes=16),
+        )
+
+        review = scanner.outcome_review(limit=1)
+        self.assertTrue(review["read_only"])
+        self.assertEqual(1, review["records_returned"])
+        alert = review["alerts"][0]
+        self.assertEqual("early_acceleration", alert["signal_tier"])
+        self.assertEqual(100_000, alert["alert_market_cap_usd"])
+        self.assertEqual("sent_to_1", alert["delivery_status"])
+        self.assertTrue(alert["rugcheck"]["qualified"])
+        self.assertEqual("recorded", alert["returns"]["15m"]["status"])
+        self.assertIsNone(alert["returns"]["60m"])
+        self.assertNotIn("entry_price_usd", alert)
+        self.assertNotIn("delivery_error", alert)
+
+        alert["rugcheck"]["checks"].append("mutated")
+        fresh = scanner.outcome_review(limit=1)
+        self.assertNotIn("mutated", fresh["alerts"][0]["rugcheck"]["checks"])
+
     def test_late_checkpoint_is_unavailable_not_mislabeled(self) -> None:
         scanner = self.scanner()
         scanner.scan_once(

@@ -1995,6 +1995,60 @@ class MemeScanner:
                 ),
             }
 
+    def outcome_review(self, *, limit: int = 500) -> dict[str, Any]:
+        """Return a read-only, allowlisted projection of the outcome ledger."""
+        bounded_limit = max(1, min(int(limit), self.config.max_saved_outcome_alerts))
+        with self._lock:
+            records = []
+            for alert in self._state["outcome_alerts"][:bounded_limit]:
+                outcomes = alert.get("outcomes", {})
+                records.append(
+                    {
+                        "created_at": alert.get("created_at"),
+                        "network": alert.get("network"),
+                        "symbol": alert.get("symbol"),
+                        "token_address": alert.get("token_address"),
+                        "pool_address": alert.get("pool_address"),
+                        "signal_tier": alert.get("signal_tier"),
+                        "alert_market_cap_usd": alert.get("market_cap_usd"),
+                        "delivery_status": alert.get("delivery"),
+                        "rugcheck": {
+                            "qualified": "risk screen passed"
+                            in alert.get("qualification_evidence", []),
+                            "risk_score": alert.get("risk_score"),
+                            "checks": json.loads(
+                                json.dumps(alert.get("risk_checks", []))
+                            ),
+                            "qualification_evidence": json.loads(
+                                json.dumps(
+                                    alert.get("qualification_evidence", [])
+                                )
+                            ),
+                        },
+                        "returns": {
+                            "15m": json.loads(
+                                json.dumps(outcomes.get("15m"))
+                            )
+                            if outcomes.get("15m") is not None
+                            else None,
+                            "60m": json.loads(
+                                json.dumps(outcomes.get("60m"))
+                            )
+                            if outcomes.get("60m") is not None
+                            else None,
+                        },
+                    }
+                )
+            return {
+                "read_only": True,
+                "generated_at": _iso(_utc_now()),
+                "records_returned": len(records),
+                "aggregate": json.loads(
+                    json.dumps(self._outcome_summary_locked())
+                ),
+                "alerts": records,
+            }
+
     def telegram_status(self) -> str:
         snap = self.snapshot()
         return (
