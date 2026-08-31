@@ -20,7 +20,9 @@ from __future__ import annotations
 import json
 import hmac
 import logging
+import math
 import os
+import socket
 import threading
 import time
 from dataclasses import dataclass, field, asdict
@@ -71,6 +73,8 @@ _active_lease: SingletonLease | None = None
 _activation_state = (
     "waiting_for_lease" if DESIGNATED_SERVICE else "health-only"
 )
+_binance_connectivity_lock = threading.Lock()
+_binance_unavailable_sources: set[str] = set()
 
 # ── Per-pair state ─────────────────────────────────────────────────────────────
 
@@ -102,13 +106,17 @@ import notify
 from meme_scanner import MemeScanner, ScannerConfig
 
 
-def _base_order_permission() -> bool:
+def _control_plane_ready() -> bool:
     return bool(
         DESIGNATED_SERVICE
         and _active_owner_event.is_set()
         and _active_lease is not None
         and notify.telegram_health_snapshot()["polling_healthy"]
     )
+
+
+def _base_order_permission() -> bool:
+    return _control_plane_ready() and _binance_connectivity_available()
 
 
 _order_gate = SynchronizedOrderGate(_base_order_permission)
@@ -231,10 +239,57 @@ def _orders_allowed() -> bool:
     return _order_gate.is_allowed()
 
 
+def _binance_connectivity_available() -> bool:
+    with _binance_connectivity_lock:
+        return not _binance_unavailable_sources
+
+
+def _mark_binance_connectivity_unavailable(source: str) -> None:
+    with _binance_connectivity_lock:
+        _binance_unavailable_sources.add(source)
+
+
+def _mark_binance_connectivity_recovered(source: str) -> bool:
+    with _binance_connectivity_lock:
+        _binance_unavailable_sources.discard(source)
+        return not _binance_unavailable_sources
+
+
+def _is_transient_binance_connectivity_error(exc: BaseException) -> bool:
+    """Recognize DNS failures that happen before a request can reach Binance."""
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, socket.gaierror):
+            return True
+        current = current.__cause__ or current.__context__
+
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "nameresolutionerror",
+            "failed to resolve",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "nodename nor servname provided",
+        )
+    )
+
+
+def _connectivity_retry_seconds(consecutive_failures: int) -> int:
+    failures = max(1, int(consecutive_failures))
+    return min(300, 15 * (2 ** min(failures - 1, 5)))
+
+
 def _trade_pair(symbol: str):
     st = _pair_states[symbol]
     MAX_BACKOFF = 60
     attempt = 0
+    connectivity_failures = 0
+    connectivity_outage_announced = False
+    started_announced = False
     trader = _traders.get(symbol)
 
     while True:
@@ -253,14 +308,10 @@ def _trade_pair(symbol: str):
                 with _state_lock:
                     _traders[symbol] = trader
 
-            notify.broadcast(
-                f"🤖 <b>Crypto Bot — {symbol}</b> started\n"
-                f"Budget: ${BUDGET_PER_PAIR:.0f} | Interval: {INTERVAL} | Scan: {SCAN_SECS}s"
-            )
             daily_loss_limit = BUDGET_PER_PAIR * DAILY_LOSS_LIMIT_PCT
 
             while True:
-                if not _orders_allowed():
+                if not _control_plane_ready():
                     st.status = "⛔ Trading blocked — Telegram polling is unhealthy"
                     time.sleep(5)
                     continue
@@ -286,6 +337,29 @@ def _trade_pair(symbol: str):
                 # ── Fetch candles + analyze ──────────────────────────────────
                 closes, volumes = trader.get_klines(INTERVAL, limit=120)
                 snap = strategy.analyze(closes, volumes)
+                if connectivity_failures:
+                    logger.info(
+                        "[%s] Binance connectivity restored after %s failed attempt(s)",
+                        symbol,
+                        connectivity_failures,
+                    )
+                    if connectivity_outage_announced:
+                        notify.broadcast(
+                            f"✅ {symbol}: Binance connectivity restored; "
+                            "normal monitoring resumed."
+                        )
+                    connectivity_failures = 0
+                    connectivity_outage_announced = False
+                    if _mark_binance_connectivity_recovered(symbol):
+                        _order_gate.set_enabled(True)
+                if not started_announced:
+                    notify.broadcast(
+                        f"🤖 <b>Crypto Bot — {symbol}</b> started\n"
+                        f"Budget: ${BUDGET_PER_PAIR:.0f} | "
+                        f"Interval: {INTERVAL} | Scan: {SCAN_SECS}s"
+                    )
+                    started_announced = True
+                attempt = 0
 
                 in_pos = trader.position is not None
                 entry = trader.position.entry_price if in_pos else None
@@ -336,6 +410,8 @@ def _trade_pair(symbol: str):
                         )
                         notify.broadcast(msg)
                     except Exception as e:
+                        if _is_transient_binance_connectivity_error(e):
+                            raise
                         code = getattr(e, "code", None) or getattr(e, "status_code", None)
                         logger.warning(f"[{symbol}] BUY skipped: {e}")
                         if "-2010" in str(e) or code == -2010:
@@ -358,6 +434,8 @@ def _trade_pair(symbol: str):
                         )
                         notify.broadcast(msg)
                     except Exception as e:
+                        if _is_transient_binance_connectivity_error(e):
+                            raise
                         logger.warning(f"[{symbol}] SELL error: {e}")
                         notify.broadcast(f"⚠️ {symbol} SELL failed: {e}")
                         # Don't re-raise — position was already cleared if balance was 0
@@ -365,7 +443,32 @@ def _trade_pair(symbol: str):
                 time.sleep(SCAN_SECS)
 
         except Exception as exc:
-            backoff = min(MAX_BACKOFF, 10 * attempt)
+            if _is_transient_binance_connectivity_error(exc):
+                connectivity_failures += 1
+                backoff = _connectivity_retry_seconds(connectivity_failures)
+                _mark_binance_connectivity_unavailable(symbol)
+                _order_gate.set_enabled(False)
+                st.status = (
+                    "Binance connectivity unavailable — "
+                    f"retrying in {backoff}s"
+                )
+                logger.warning(
+                    "[%s] Binance DNS/network unavailable: %s. Retrying in %ss",
+                    symbol,
+                    exc,
+                    backoff,
+                )
+                if not connectivity_outage_announced:
+                    notify.broadcast(
+                        f"⚠️ {symbol}: Binance connectivity is temporarily "
+                        f"unavailable. No order will be attempted; retrying "
+                        f"automatically in {backoff}s."
+                    )
+                    connectivity_outage_announced = True
+                trader = None
+                time.sleep(backoff)
+                continue
+            backoff = min(MAX_BACKOFF, 10 * max(attempt, 1))
             logger.error(f"[{symbol}] Loop crashed: {exc}. Restarting in {backoff}s…")
             notify.broadcast(f"⚠️ {symbol} bot crashed: {exc}\nRestarting in {backoff}s…")
             trader = None
@@ -394,7 +497,7 @@ def _prepare_active_traders() -> None:
     )
     prepared: dict[str, object] = {}
     for symbol in SYMBOLS:
-        prepared[symbol] = CryptoTrader(
+        candidate = CryptoTrader(
             API_KEY,
             API_SECRET,
             symbol=symbol,
@@ -403,6 +506,12 @@ def _prepare_active_traders() -> None:
             order_allowed=_orders_allowed,
             order_submitter=_order_gate.submit,
         )
+        price = candidate.get_price()
+        if not math.isfinite(price) or price <= 0:
+            raise RuntimeError(
+                f"Binance connectivity probe for {symbol} returned an invalid price"
+            )
+        prepared[symbol] = candidate
     if recover_positions:
         _write_position_recovery_marker()
         logger.info(
@@ -470,8 +579,6 @@ def _ownership_supervisor() -> None:
                 or "Telegram polling preflight did not succeed"
             )
         logger.info("Telegram polling preflight passed for @%s", telegram_username)
-        _activation_state = "position_recovery_preflight"
-        _prepare_active_traders()
     except Exception:
         notify.set_delivery_enabled(False)
         _activation_state = "blocked_activation_preflight"
@@ -479,6 +586,46 @@ def _ownership_supervisor() -> None:
             "Active workers remain disabled because activation preflight failed"
         )
         return
+    _activation_state = "position_recovery_preflight"
+    preflight_failures = 0
+    preflight_outage_announced = False
+    while True:
+        try:
+            _prepare_active_traders()
+            break
+        except Exception as exc:
+            if not _is_transient_binance_connectivity_error(exc):
+                notify.set_delivery_enabled(False)
+                _activation_state = "blocked_activation_preflight"
+                logger.exception(
+                    "Active workers remain disabled because Binance position "
+                    "preflight failed"
+                )
+                return
+            preflight_failures += 1
+            backoff = _connectivity_retry_seconds(preflight_failures)
+            _mark_binance_connectivity_unavailable("startup-preflight")
+            _order_gate.set_enabled(False)
+            _activation_state = "waiting_for_binance_connectivity"
+            logger.warning(
+                "Binance DNS/network unavailable during activation preflight: "
+                "%s. Retrying in %ss",
+                exc,
+                backoff,
+            )
+            if not preflight_outage_announced:
+                notify.broadcast(
+                    "⚠️ Binance connectivity is temporarily unavailable. "
+                    "Trading remains disabled while startup retries automatically."
+                )
+                preflight_outage_announced = True
+            time.sleep(backoff)
+            _activation_state = "position_recovery_preflight"
+    if preflight_failures:
+        _mark_binance_connectivity_recovered("startup-preflight")
+        notify.broadcast(
+            "✅ Binance connectivity restored; startup safety checks passed."
+        )
     _active_owner_event.set()
     _order_gate.set_enabled(True)
     _activation_state = "active"
@@ -601,11 +748,13 @@ async def health():
     telegram_status = notify.telegram_health_snapshot()
     telegram_unhealthy = (
         _active_owner_event.is_set()
-        and not _orders_allowed()
+        and not telegram_status["polling_healthy"]
     )
     blocked = _activation_state.startswith("blocked_") or telegram_unhealthy
+    binance_connectivity = _binance_connectivity_available()
     payload = {
         "ok": not blocked,
+        "degraded": not binance_connectivity,
         "runtime_owner": RUNTIME_OWNERSHIP.owner,
         "designated_service": DESIGNATED_SERVICE,
         "active_owner": _active_owner_event.is_set(),
@@ -616,6 +765,7 @@ async def health():
         ),
         "telegram": telegram_status,
         "binance_trading": _orders_allowed(),
+        "binance_connectivity": binance_connectivity,
         "state_dir": str(STATE_DIR),
         "state_durable": STATE_IS_DURABLE,
         "symbols": SYMBOLS,
