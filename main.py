@@ -57,6 +57,8 @@ SYMBOLS    = [s.strip().upper() for s in os.getenv("CRYPTO_SYMBOLS", "SOLUSDT,BT
 TOTAL_BUDGET = float(os.getenv("CRYPTO_BUDGET_USDT", "100"))
 INTERVAL   = os.getenv("CRYPTO_INTERVAL", "5m")
 SCAN_SECS  = int(os.getenv("CRYPTO_SCAN_SECS", "60"))
+COOLDOWN_MINUTES = int(os.getenv("CRYPTO_COOLDOWN_MINUTES", "15"))
+LOSS_COOLDOWN_MINUTES = int(os.getenv("CRYPTO_LOSS_COOLDOWN_MINUTES", "60"))
 PORT       = int(os.getenv("PORT", "8004"))
 
 if DESIGNATED_SERVICE and (not API_KEY or not API_SECRET or not TELEGRAM_TOKEN):
@@ -99,6 +101,60 @@ _pair_states: dict[str, PairState] = {s: PairState(symbol=s) for s in SYMBOLS}
 _traders: dict[str, object] = {}
 _state_lock = threading.Lock()
 _POSITION_RECOVERY_MARKER = STATE_DIR / "exchange-position-recovery-v1.json"
+_ENTRY_GUARD_FILE = STATE_DIR / "entry-guard-v1.json"
+_entry_guard_lock = threading.Lock()
+
+
+def _load_entry_guards() -> dict[str, dict]:
+    if not _ENTRY_GUARD_FILE.exists():
+        return {}
+    try:
+        payload = json.loads(_ENTRY_GUARD_FILE.read_text())
+    except Exception as exc:
+        raise RuntimeError("Could not read persistent entry guard state") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("Persistent entry guard state must be an object")
+    return payload
+
+
+def _save_entry_guards(guards: dict[str, dict]) -> None:
+    temp = _ENTRY_GUARD_FILE.with_suffix(".tmp")
+    with temp.open("w", encoding="utf-8") as handle:
+        json.dump(guards, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, _ENTRY_GUARD_FILE)
+
+
+def _entry_block_reason(symbol: str, candle_open_ms: int, now: float | None = None) -> str:
+    now = time.time() if now is None else now
+    with _entry_guard_lock:
+        guard = _load_entry_guards().get(symbol, {})
+    if guard.get("last_entry_candle_ms") == candle_open_ms:
+        return "Entry already evaluated for this completed candle"
+    cooldown_until = float(guard.get("cooldown_until", 0))
+    if cooldown_until > now:
+        minutes = max(1, int((cooldown_until - now + 59) // 60))
+        return f"Post-exit cooldown active ({minutes}m remaining)"
+    return ""
+
+
+def _record_entry_attempt(symbol: str, candle_open_ms: int) -> None:
+    with _entry_guard_lock:
+        guards = _load_entry_guards()
+        guards.setdefault(symbol, {})["last_entry_candle_ms"] = candle_open_ms
+        _save_entry_guards(guards)
+
+
+def _record_exit(symbol: str, lost: bool, now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    minutes = LOSS_COOLDOWN_MINUTES if lost else COOLDOWN_MINUTES
+    with _entry_guard_lock:
+        guards = _load_entry_guards()
+        guard = guards.setdefault(symbol, {})
+        guard["cooldown_until"] = now + minutes * 60
+        guard["last_exit_was_loss"] = lost
+        _save_entry_guards(guards)
 
 # ── Telegram ───────────────────────────────────────────────────────────────────
 
@@ -335,7 +391,9 @@ def _trade_pair(symbol: str):
                     continue
 
                 # ── Fetch candles + analyze ──────────────────────────────────
-                closes, volumes = trader.get_klines(INTERVAL, limit=120)
+                closes, volumes, candle_open_ms = trader.get_completed_klines(
+                    INTERVAL, limit=121
+                )
                 snap = strategy.analyze(closes, volumes)
                 if connectivity_failures:
                     logger.info(
@@ -374,7 +432,12 @@ def _trade_pair(symbol: str):
                 sig, reason = strategy.get_signal(
                     snap, in_pos, entry,
                     high_watermark=hwm,
+                    requirements=strategy.entry_requirements(symbol),
                 )
+                if sig == "buy":
+                    block = _entry_block_reason(symbol, candle_open_ms)
+                    if block:
+                        sig, reason = "hold", block
 
                 # Update shared state
                 with _state_lock:
@@ -396,6 +459,7 @@ def _trade_pair(symbol: str):
 
                 # ── Execute signal ───────────────────────────────────────────
                 if sig == "buy":
+                    _record_entry_attempt(symbol, candle_open_ms)
                     try:
                         result = trader.buy(confidence=snap.confidence)
                         msg = (
@@ -415,7 +479,9 @@ def _trade_pair(symbol: str):
                         code = getattr(e, "code", None) or getattr(e, "status_code", None)
                         logger.warning(f"[{symbol}] BUY skipped: {e}")
                         if "-2010" in str(e) or code == -2010:
-                            notify.broadcast(f"⚠️ {symbol}: not enough USDT to buy — skipping this signal.")
+                            notify.broadcast_operational_error(
+                                f"⚠️ {symbol}: not enough USDT to buy — skipping this signal."
+                            )
                         # Don't re-raise — just skip this signal and continue scanning
 
                 elif sig == "sell":
@@ -424,6 +490,7 @@ def _trade_pair(symbol: str):
                         pnl, pnl_pct = result["pnl"], result["pnl_pct"]
                         with _state_lock:
                             st.daily_pnl += pnl
+                        _record_exit(symbol, lost=pnl < 0)
                         emoji = "💰" if pnl >= 0 else "🔴"
                         msg = (
                             f"{emoji} <b>SELL {symbol}</b>\n"
@@ -437,7 +504,9 @@ def _trade_pair(symbol: str):
                         if _is_transient_binance_connectivity_error(e):
                             raise
                         logger.warning(f"[{symbol}] SELL error: {e}")
-                        notify.broadcast(f"⚠️ {symbol} SELL failed: {e}")
+                        notify.broadcast_operational_error(
+                            f"⚠️ {symbol} SELL failed: {e}"
+                        )
                         # Don't re-raise — position was already cleared if balance was 0
 
                 time.sleep(SCAN_SECS)
@@ -459,7 +528,7 @@ def _trade_pair(symbol: str):
                     backoff,
                 )
                 if not connectivity_outage_announced:
-                    notify.broadcast(
+                    notify.broadcast_operational_error(
                         f"⚠️ {symbol}: Binance connectivity is temporarily "
                         f"unavailable. No order will be attempted; retrying "
                         f"automatically in {backoff}s."
@@ -470,7 +539,9 @@ def _trade_pair(symbol: str):
                 continue
             backoff = min(MAX_BACKOFF, 10 * max(attempt, 1))
             logger.error(f"[{symbol}] Loop crashed: {exc}. Restarting in {backoff}s…")
-            notify.broadcast(f"⚠️ {symbol} bot crashed: {exc}\nRestarting in {backoff}s…")
+            notify.broadcast_operational_error(
+                f"⚠️ {symbol} bot crashed: {exc}\nRestarting in {backoff}s…"
+            )
             trader = None
             time.sleep(backoff)
 
@@ -531,6 +602,7 @@ def _start_active_workers() -> None:
         name="telegram-command-poller",
     ).start()
     logger.info("Railway Telegram command polling started")
+    notify.send_status_keyboard()
     for sym in SYMBOLS:
         t = threading.Thread(
             target=_trade_pair,
@@ -614,7 +686,7 @@ def _ownership_supervisor() -> None:
                 backoff,
             )
             if not preflight_outage_announced:
-                notify.broadcast(
+                notify.broadcast_operational_error(
                     "⚠️ Binance connectivity is temporarily unavailable. "
                     "Trading remains disabled while startup retries automatically."
                 )
@@ -703,6 +775,7 @@ async def api_status():
         "meme_scanner": _meme_scanner.snapshot(),
     })
 
+
 @app.get("/crypto/api/meme-outcomes")
 async def meme_outcomes(
     authorization: str | None = Header(default=None),
@@ -781,15 +854,6 @@ async def health():
 def _run_server():
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
 
-threading.Thread(target=_run_server, daemon=True).start()
-logger.info(f"Dashboard on port {PORT} at /crypto")
-
-threading.Thread(
-    target=_ownership_supervisor,
-    daemon=True,
-    name="ownership-supervisor",
-).start()
-
 def _keep_alive():
     import urllib.request
     domain = os.getenv("REPLIT_DEV_DOMAIN", "")
@@ -806,9 +870,22 @@ def _keep_alive():
             except Exception:
                 pass
 
-threading.Thread(target=_keep_alive, daemon=True).start()
-logger.info("Keep-alive pinger started")
+def main() -> None:
+    threading.Thread(target=_run_server, daemon=True).start()
+    logger.info(f"Dashboard on port {PORT} at /crypto")
 
-# Keep main thread alive
-while True:
-    time.sleep(60)
+    threading.Thread(
+        target=_ownership_supervisor,
+        daemon=True,
+        name="ownership-supervisor",
+    ).start()
+
+    threading.Thread(target=_keep_alive, daemon=True).start()
+    logger.info("Keep-alive pinger started")
+
+    while True:
+        time.sleep(60)
+
+
+if __name__ == "__main__":
+    main()

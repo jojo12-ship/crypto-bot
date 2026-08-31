@@ -10,10 +10,56 @@ import notify
 class TelegramPollingTests(unittest.TestCase):
     def setUp(self) -> None:
         notify._delivery_enabled = True
+        notify._last_operational_error_at = 0.0
         notify._last_poll_success_monotonic = None
         notify._last_poll_error = None
         notify._consecutive_poll_failures = 0
         notify._status_render_inflight = False
+
+    @patch("notify.current_runtime_ownership")
+    @patch("notify._save_state_locked")
+    @patch("notify.broadcast")
+    def test_operational_errors_are_limited_globally_to_one_per_hour(
+        self, broadcast, save_state, ownership
+    ) -> None:
+        ownership.return_value = SimpleNamespace(is_designated_service=True)
+        with patch.object(notify, "TOKEN", "configured"):
+            self.assertEqual(
+                broadcast.return_value,
+                notify.broadcast_operational_error("SOL failed", now=10_000),
+            )
+            self.assertEqual(
+                0,
+                notify.broadcast_operational_error("BTC failed", now=10_060),
+            )
+            self.assertEqual(
+                broadcast.return_value,
+                notify.broadcast_operational_error("ETH failed", now=13_600),
+            )
+
+        self.assertEqual(
+            [unittest.mock.call("SOL failed"), unittest.mock.call("ETH failed")],
+            broadcast.call_args_list,
+        )
+        self.assertEqual(2, save_state.call_count)
+
+    @patch("notify.current_runtime_ownership")
+    @patch("notify._save_state_locked")
+    @patch("notify.broadcast")
+    def test_trade_alerts_bypass_operational_error_limit(
+        self, broadcast, save_state, ownership
+    ) -> None:
+        ownership.return_value = SimpleNamespace(is_designated_service=True)
+        notify._last_operational_error_at = 10_000
+        with patch.object(notify, "TOKEN", "configured"):
+            notify.broadcast("BUY SOLUSDT")
+            notify.broadcast("STOP LOSS SOLUSDT")
+
+        self.assertEqual(
+            [unittest.mock.call("BUY SOLUSDT"), unittest.mock.call("STOP LOSS SOLUSDT")],
+            broadcast.call_args_list,
+        )
+        save_state.assert_not_called()
 
     @patch("notify.current_runtime_ownership")
     @patch("notify._post")

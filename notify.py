@@ -35,6 +35,7 @@ _state_dir = Path(
 ).expanduser().resolve()
 _state_file = _state_dir / "crypto_notify_state.json"
 _delivery_enabled = False
+_OPERATIONAL_ERROR_INTERVAL_SECONDS = 3600
 _STATUS_KEYBOARD = {
     "keyboard": [[{"text": "📊 Status"}]],
     "resize_keyboard": True,
@@ -57,6 +58,17 @@ def _load_state() -> tuple[set[int], int]:
         return set(), 0
 
 
+def _load_last_operational_error_at() -> float:
+    try:
+        if not _state_file.exists():
+            return 0.0
+        raw = json.loads(_state_file.read_text())
+        return max(0.0, float(raw.get("last_operational_error_at", 0.0)))
+    except Exception as exc:
+        logger.warning("Could not load operational alert state: %s", exc)
+        return 0.0
+
+
 def _save_state_locked() -> None:
     try:
         _state_dir.mkdir(parents=True, exist_ok=True)
@@ -66,6 +78,7 @@ def _save_state_locked() -> None:
                 {
                     "subscribers": sorted(_subscribers),
                     "offset": _offset,
+                    "last_operational_error_at": _last_operational_error_at,
                 },
                 handle,
                 indent=2,
@@ -78,6 +91,7 @@ def _save_state_locked() -> None:
 
 
 _subscribers, _offset = _load_state()
+_last_operational_error_at = _load_last_operational_error_at()
 
 
 def set_delivery_enabled(enabled: bool) -> None:
@@ -288,6 +302,25 @@ def broadcast(text: str) -> int:
         if response.get("ok") is True:
             delivered += 1
     return delivered
+
+
+def broadcast_operational_error(text: str, *, now: float | None = None) -> int:
+    """Send at most one operational-error notification per hour globally."""
+    global _last_operational_error_at
+    if not TOKEN or not _can_use_telegram():
+        return 0
+    current_time = time.time() if now is None else float(now)
+    with _lock:
+        elapsed = current_time - _last_operational_error_at
+        if elapsed < _OPERATIONAL_ERROR_INTERVAL_SECONDS:
+            logger.warning(
+                "Suppressed operational Telegram error during hourly cooldown: %s",
+                _plain_text(text).replace("\n", " "),
+            )
+            return 0
+        _last_operational_error_at = current_time
+        _save_state_locked()
+    return broadcast(text)
 
 
 def send_status_keyboard() -> int:
