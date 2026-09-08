@@ -43,7 +43,7 @@ from singleton_lease import SingletonLease
 from state_store import configured_state_dir, position_recovery_marker_matches
 
 RUNTIME_OWNERSHIP = current_runtime_ownership()
-DESIGNATED_SERVICE = RUNTIME_OWNERSHIP.is_designated_service
+DESIGNATED_SERVICE = False  # Emergency pause: no Binance orders or Telegram polling
 STATE_DIR, STATE_IS_DURABLE = configured_state_dir(
     fallback_dir=Path(__file__).parent
 )
